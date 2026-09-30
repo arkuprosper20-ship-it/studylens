@@ -12,6 +12,10 @@ Static site, no build. Locally: `python3 -m http.server` and open localhost. Ver
 
 ## Authentication
 - **Local prototype mode** (default, `FIREBASE_CONFIG = null`): accounts live in this browser's localStorage, passwords are salted PBKDF2 hashes. **This is a demonstration, not production authentication** — anyone with access to the browser profile can read the data.
-- **Production:** set `FIREBASE_CONFIG` to use Firebase Auth + Firestore. See `firebase-migration.md` (setup and security rules).
+- **Production:** set `FIREBASE_CONFIG` to use Firebase Auth + Firestore. See `firebase-migration.md` (setup and security rules). Includes an **Admin** page for looking up users by UID (requires an admin role in Firestore).
+
+## Admin page
 
 History keeps the 30 most recent assignments. After the first load, the app shell is cached by a service worker so the local engine works offline (local mode only; Firebase needs a connection).
+
+The **Admin** page (visible in the shell navigation when signed in) lets a staff member enter a Firebase UID to look up that user's profile and saved assignments. This requires Firebase mode and an admin role in Firestore — see `firebase-migration.md`.

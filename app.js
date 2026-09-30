@@ -112,6 +112,10 @@ function localProvider() {
     async save(uid, item) {
       const l = read(K.h + uid, []).filter(x => x.id !== item.id); l.unshift(item);
       l.sort((a, b) => b.createdAt - a.createdAt); localStorage.setItem(K.h + uid, JSON.stringify(l.slice(0, MAX_HISTORY)));
+    },
+    async getUser(uid) {
+      const u = users().find(x => x.uid === uid);
+      return u ? { uid: u.uid, name: u.name, email: u.email, role: u.role, createdAt: u.createdAt, updatedAt: u.updatedAt } : null;
     }
   };
 }
@@ -146,14 +150,18 @@ async function firebaseProvider(cfg) {
       const q = F.query(F.collection(db, 'users', uid, 'assignments'), F.orderBy('createdAt', 'desc'), F.limit(MAX_HISTORY));
       return (await F.getDocs(q)).docs.map(d => d.data());
     }),
-    save: wrap((uid, item) => F.setDoc(F.doc(db, 'users', uid, 'assignments', item.id), item))
+    save: wrap((uid, item) => F.setDoc(F.doc(db, 'users', uid, 'assignments', item.id), item)),
+    getUser: wrap(async uid => {
+      const d = await F.getDoc(F.doc(db, 'users', uid));
+      return d.exists() ? d.data() : null;
+    })
   };
 }
 
 /* ---------- UI ---------- */
 let P;
-const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '' };
-const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account'].includes(r) ? r : 'dashboard'; };
+const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1', adminUser: null, adminAssignments: [], adminSearched: false };
+const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'admin'].includes(r) ? r : 'dashboard'; };
 const initials = n => (n || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
 const fmt = ts => new Date(ts).toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
 const doneCount = a => a.done.filter(Boolean).length;
@@ -175,14 +183,14 @@ function authView() {
 }
 
 function shell(page) {
-  const links = [['dashboard', 'Dashboard'], ['history', 'History'], ['account', 'Account']];
+  const links = [['dashboard', 'Dashboard'], ['history', 'History'], ['account', 'Account'], ['admin', 'Admin']];
   const a = (id, l) => `<a href="#/${id}" class="${page === id ? 'on' : ''}">${l}</a>`;
   return `<header class="top"><div class="brand"><span class="logo">S</span>StudyLens</div><nav>${links.map(([i, l]) => a(i, l)).join('')}<button data-a="logout">Log out</button></nav></header>
   <div class="shell"><aside class="side"><div class="brand"><span class="logo">S</span>StudyLens</div>
   <div class="me"><span class="av">${esc(initials(S.user.name))}</span><div><p>${esc(S.user.name || 'Student')}</p><p class="mu">${esc(S.user.email)}</p></div></div>
-  <nav class="nav">${a('dashboard', 'Dashboard')}${a('history', 'Assignment History')}${a('account', 'Account')}</nav>
+  <nav class="nav">${a('dashboard', 'Dashboard')}${a('history', 'Assignment History')}${a('account', 'Account')}${a('admin', 'Admin')}</nav>
   <div class="foot"><span class="mu"><i class="dot"></i>Offline-ready</span><button class="btn" data-a="logout">Log out</button></div></aside>
-  <main>${page === 'history' ? historyView() : page === 'account' ? accountView() : dashView()}</main></div>`;
+  <main>${page === 'history' ? historyView() : page === 'account' ? accountView() : page === 'admin' ? adminView() : dashView()}</main></div>`;
 }
 
 function dashView() {
@@ -211,6 +219,28 @@ function accountView() {
   return `<h1>Profile</h1><form class="card form" data-form="profile" novalidate><div class="acc"><span class="av big">${esc(initials(S.user.name))}</span><h3>${esc(S.user.name || 'Student')}</h3></div>
   <label for="pn">Name</label><input id="pn" name="name" value="${esc(S.user.name)}" autocomplete="name"><label for="pe">Email</label><input id="pe" value="${esc(S.user.email)}" disabled>
   <p class="err ${S.msg ? 'okmsg' : ''}" role="alert">${esc(S.msg || S.err)}</p><button class="btn pri" style="width:auto" ${S.busy ? 'disabled' : ''}>Save profile</button></form>`;
+}
+
+function adminView() {
+  const u = S.adminUser;
+  let out = `<h1>Admin lookup</h1>
+  <form class="card form" data-form="admin" novalidate>
+  <label for="uid">User UID</label><input id="uid" name="uid" value="${esc(S.adminUid)}" autocomplete="off" placeholder="Enter a Firebase UID">
+  <p class="err" role="alert">${esc(S.err)}</p>
+  <button class="btn pri" ${S.busy ? 'disabled' : ''}>Look up user →</button>
+  </form>`;
+  if (P.mode === 'local') out += '<p class="note">Admin features require Firebase (Firestore) to look up other users. Local mode can only show the signed-in user.</p>';
+  if (u) {
+    out += `<div class="card"><div class="acc"><span class="av big">${esc(initials(u.name))}</span>
+    <div><h3>${esc(u.name || 'Unknown')}</h3><p class="mu">${esc(u.email || '—')}</p></div></div>
+    <p class="mu" style="margin-top:.6rem">Role: <b>${esc(u.role)}</b> · Created: ${u.createdAt ? esc(fmt(u.createdAt)) : '—'} · Updated: ${u.updatedAt ? esc(fmt(u.updatedAt)) : '—'}
+    </p></div>
+    <h3>Assignments (${S.adminAssignments.length})</h3>`;
+    out += S.adminAssignments.length ? `<div class="hist">${S.adminAssignments.map(a => `<div class="card item"><div><h3>${esc(a.result && a.result.type ? a.result.type : '—')}</h3><p class="mu">${a.createdAt ? esc(fmt(a.createdAt)) : '—'}</p><p class="mu">${a.result && a.result.tasks ? doneCount(a) + '/' + a.result.tasks.length + ' tasks done' : '—'}</p></div></div>`).join('')}</div>`
+      : '<p class="mu">No assignments saved.</p>';
+  } else if (S.adminSearched) out += '<p class="note">No user found with that UID.</p>';
+  else out += '<p class="note">Enter a UID and click Look up to see user details and assignments.</p>';
+  return out;
 }
 
 function render() {
@@ -244,6 +274,18 @@ document.addEventListener('submit', e => {
     const name = (v.name || '').trim();
     if (!name) { S.err = 'Please complete all required fields.'; return render(); }
     return run(async () => { await P.updateName(S.user.uid, name); S.msg = 'Profile saved.'; });
+  }
+  if (kind === 'admin') {
+    const uid = (v.uid || '').trim();
+    if (!uid) { S.err = 'Please enter a UID.'; return render(); }
+    return run(async () => {
+      S.adminUid = uid;
+      const user = await P.getUser(uid);
+      S.adminUser = user || null;
+      S.adminSearched = true;
+      if (user) { S.adminAssignments = await P.list(uid).catch(() => []); }
+      else { S.adminAssignments = []; }
+    });
   }
   const email = (v.email || '').trim().toLowerCase(), pw = v.password || '', reg = kind === 'register';
   if (!email || !pw || (reg && (!(v.name || '').trim() || !v.confirm))) { S.err = 'Please complete all required fields.'; return render(); }
