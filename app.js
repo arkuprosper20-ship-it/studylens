@@ -13,6 +13,7 @@ const FIREBASE_CONFIG = {
 };
 // Optional AI enhancement: async (text) => result object. null = local engine only.
 const AI_PROVIDER = null;
+const DEMO_PROMPT = 'Write a 1,500-word essay about climate change. Use at least 3 credible sources. Discuss two causes, explain the effects, propose solutions, and submit by Friday.';
 
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -34,6 +35,24 @@ const TYPES = [
   ['Study / exam', /\b(exam|quiz|midterm|final|study|test|revise|revision|chapters?)\b/gi],
   ['Essay / Paper', /\b(essay|paper|thesis|article|reflection|report|write|argumentative)\b/gi]];
 
+const VERB_QUESTIONS = {
+  analyze: { q: 'What does "analyze" mean here?', opts: ['Write a brief summary', 'Break the topic into parts and explain how they relate', 'Give your opinion'], answer: 1, exp: '"Analyze" means breaking the topic into parts and explaining the relationships between them.' },
+  compare: { q: 'What does "compare" require?', opts: ['List similarities only', 'Identify both similarities AND differences', 'State your preference'], answer: 1, exp: 'To compare means identifying both how things are similar and how they differ.' },
+  contrast: { q: 'What does "contrast" require?', opts: ['List similarities only', 'Identify both similarities AND differences', 'Focus only on differences and their significance'], answer: 2, exp: '"Contrast" emphasizes the differences and their significance between topics.' },
+  discuss: { q: 'What does "discuss" ask for?', opts: ['Mention briefly in one sentence', 'Give the topic attention in writing, considering multiple viewpoints', 'Ignore opposing viewpoints'], answer: 1, exp: '"Discuss" means addressing the topic in writing and considering different angles or arguments.' },
+  explain: { q: 'What does "explain" require?', opts: ['Just define the term', 'Make it clear how something works or why it happens, with reasons', 'Provide a one-word answer'], answer: 1, exp: '"Explain" means making something clear by describing how it works or why it happens.' },
+  propose: { q: 'What does "propose" mean?', opts: ['List random facts', 'Suggest possible ways to address the problem', 'Copy solutions from a source'], answer: 1, exp: '"Propose" means suggesting possible ways to address or fix the problem.' },
+  evaluate: { q: 'What does "evaluate" require?', opts: ['State your opinion only', 'Make a judgment based on criteria and supporting evidence', 'Describe without judging'], answer: 1, exp: '"Evaluate" means making a judgment based on specific criteria and supporting evidence.' },
+  describe: { q: 'What does "describe" ask for?', opts: ['Your feelings about it', 'A detailed written account', 'One-word answers'], answer: 1, exp: '"Describe" means giving a detailed written account so the reader can form a clear mental picture.' },
+  examine: { q: 'What does "examine" require?', opts: ['Look quickly', 'Inspect closely and report your findings', 'Skip it'], answer: 1, exp: '"Examine" means inspecting closely and reporting what you find.' },
+  investigate: { q: 'What does "investigate" mean?', opts: ['Ask a friend', 'Carry out a systematic inquiry to discover facts', 'Guess'], answer: 1, exp: '"Investigate" means carrying out a systematic inquiry to discover facts or principles.' },
+  summarize: { q: 'What does "summarize" require?', opts: ['Copy the whole text', 'Present the main points in a shorter form', 'Write more than the original'], answer: 1, exp: '"Summarize" means presenting the main points in a shorter, condensed form.' },
+  argue: { q: 'What does "argue/argumentative" require?', opts: ['State your opinion angrily', 'Put forward claims with evidence and address counterarguments', 'Fight with someone'], answer: 1, exp: 'An argumentative piece puts forward claims supported by evidence and addresses counterarguments.' },
+  write: { q: 'What does "write an essay" expect?', opts: ['Type any thoughts', 'A structured piece with introduction, body, and conclusion', 'Emojis only'], answer: 1, exp: 'Writing an essay means producing a structured piece with introduction, body, and conclusion.' },
+  create: { q: 'What does "create/design" ask for?', opts: ['Copy an existing solution', 'Produce something new using your knowledge', 'Do nothing'], answer: 1, exp: '"Create" or "design" means producing something new using your knowledge and creativity.' },
+  research: { q: 'What does "research" require?', opts: ['Read Wikipedia once', 'Gather information from multiple sources', 'Google for 5 minutes'], answer: 1, exp: '"Research" means gathering information from multiple credible sources to support your work.' }
+};
+
 function analyzeLocal(text) {
   let type = 'General assignment', best = 0;
   for (const [name, re] of TYPES) { const n = (text.match(re) || []).length; if (n > best) { best = n; type = name; } }
@@ -46,7 +65,7 @@ function analyzeLocal(text) {
   const keywords = KEYS.filter(([, stem]) => new RegExp('\\b' + stem, 'i').test(text)).map(k => k[0]);
   const requirements = text.split(/(?<=[.!?])\s+|\n+/).map(x => x.replace(/^[\s\-*•\d.)]+/, '').trim())
     .filter(x => x.length > 3 && (KEYS.some(([, st]) => new RegExp('\\b' + st, 'i').test(x)) || /\d+\s*-?\s*words?\b/i.test(x)));
-  return { type, words, sources, deadline, keywords, requirements, tasks: buildTasks(type, { words, sources, deadline, keywords }), engine: 'local' };
+  return { type, words, sources, deadline, keywords, requirements, tasks: buildTasks(type, { words, sources, deadline, keywords }), factors: buildUnderstanding({ type, words, sources, deadline, keywords, requirements }, text), engine: 'local' };
 }
 function buildTasks(type, d) {
   const by = d.deadline ? ` before the ${d.deadline} deadline` : '';
@@ -59,6 +78,18 @@ function buildTasks(type, d) {
     outline, draft,
     d.keywords.length ? `Review against the prompt (check: ${d.keywords.slice(0, 6).join(', ').toLowerCase()})` : 'Review against the original requirements',
     `Proofread, test and prepare the final submission${by}`];
+}
+function buildUnderstanding(r, text) {
+  const verbs = Object.keys(VERB_QUESTIONS).filter(v => new RegExp('\\b' + v, 'i').test(text));
+  const firstVerb = verbs[0];
+  const q = VERB_QUESTIONS[firstVerb] || { q: 'What is the first step in understanding an assignment?', opts: ['Jump straight to writing', 'Identify the task type and key verb(s)', 'Ask someone else'], answer: 1, exp: 'First, identify what kind of assignment it is and look for key instruction verbs.' };
+  return [
+    { id: 'task', title: 'What am I being asked to do?', detail: r.type, explanation: `This assignment is a <b>${r.type}</b>${verbs.length ? `. Key instruction word(s): <b>${verbs.join(', ')}</b>` : ''}.`, quiz: q },
+    { id: 'requirements', title: 'What must I include?', detail: r.requirements.length ? r.requirements.join('<br>') : 'No specific section requirements found', explanation: r.keywords.length ? `The prompt mentions these concepts: <b>${r.keywords.join(', ')}</b>. You should address all of them.` : 'No requirement keywords were detected, but make sure to address every part of the prompt.', quiz: { q: 'Why list every requirement before starting?', opts: ['To have a checklist and avoid missing anything', 'To make the assignment longer', 'It is not necessary'], answer: 0, exp: 'Listing requirements gives you a checklist so nothing important is missed.' } },
+    { id: 'evidence', title: 'What evidence do I need?', detail: r.sources ? `At least ${r.sources} credible source(s)` : 'No specific source count stated', explanation: r.sources ? `You need <b>at least ${r.sources} credible source(s)</b>. Look for sources with clear authorship, recent publication, and references.` : 'Check if your assignment expects research even if no specific number is stated.', quiz: r.sources ? { q: 'Which is a sign of a credible source?', opts: ['Anyone can publish with no review', 'Author credentials listed; published by a reputable institution', 'No citations to other work', 'Published on any personal blog'], answer: 1, exp: 'Credible sources have identifiable expert authors and are published by reputable institutions.' } : { q: 'Why use credible sources?', opts: ['To copy content directly', 'To support ideas with reliable evidence', 'To fill space'], answer: 1, exp: 'Credible sources give your work authority and let others verify your claims.' } },
+    { id: 'output', title: 'How much do I need to produce?', detail: r.words ? `${r.words.toLocaleString()} words` : 'No word count specified', explanation: r.words ? `Target: <b>${r.words.toLocaleString()} words</b> (~${Math.round(r.words / 250)} double-spaced page(s)).` : 'No specific quantity was detected. Re-read the prompt carefully.', quiz: { q: 'How many words is roughly one double-spaced page (12pt font)?', opts: ['250', '500', '1,000'], answer: 0, exp: 'A double-spaced page in a standard 12-point font is roughly 250&ndash;300 words.' } },
+    { id: 'submission', title: 'When and how do I submit it?', detail: r.deadline || 'No deadline detected', explanation: r.deadline ? `Due: <b>${r.deadline}</b>.` : 'No specific deadline was detected. Check the syllabus or assignment page.', quiz: { q: 'Why is the deadline important?', opts: ['To plan backwards and avoid last-minute work', 'To skip the assignment', 'Deadlines are optional'], answer: 0, exp: 'Planning backwards from the deadline helps you allocate time to each section.' } }
+  ];
 }
 // </analysis>
 
@@ -160,7 +191,7 @@ async function firebaseProvider(cfg) {
 
 /* ---------- UI ---------- */
 let P;
-const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1', adminUser: null, adminAssignments: [], adminSearched: false };
+const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
 const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'admin'].includes(r) ? r : 'dashboard'; };
 const initials = n => (n || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
 const fmt = ts => new Date(ts).toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
@@ -196,18 +227,19 @@ function shell(page) {
 function dashView() {
   return `<div><h1>What are you working on?</h1><p class="mu" style="margin-top:.6rem">Paste the full assignment prompt below.</p></div>
   <form class="card" data-form="analyze"><textarea name="text" aria-label="Assignment prompt" placeholder="e.g. Write a 1,500-word essay about climate change. Use at least 3 credible sources…">${esc(S.draft)}</textarea>
-  <p class="err" role="alert">${esc(S.err)}</p><button class="btn pri" ${S.busy ? 'disabled' : ''}>Analyze assignment →</button></form>
+  <p class="err" role="alert">${esc(S.err)}</p><div class="btns"><button class="btn pri" ${S.busy ? 'disabled' : ''}>Analyze assignment →</button><button class="btn" data-a="demo" ${S.busy ? 'disabled' : ''}>Load demo</button></div></form>
   ${S.cur ? resultView(S.cur) : `<div class="card empty"><svg viewBox="0 0 120 90" fill="none" stroke="#A78BFA" stroke-width="2"><rect x="22" y="8" width="60" height="74" rx="8" fill="#0C131E"/><path d="M34 26h36M34 38h36M34 50h20" opacity=".5"/><circle cx="82" cy="58" r="17" fill="#A78BFA22"/><path d="M94 70l12 12"/></svg><h3 style="color:var(--tx)">No assignment yet</h3><p>Paste a prompt above and StudyLens will find the requirements and build your plan.</p></div>`}`;
 }
 
 function resultView(a) {
   const r = a.result, ns = 'Not specified';
-  return `<section class="card head"><div class="orb"></div><div><p class="mu">Analysis complete</p><h2>${esc(r.type)}</h2><p class="mu">${r.engine === 'ai' ? 'Analyzed with an AI provider' : 'Analyzed locally in your browser — no AI used'}</p></div></section>
+  return `<section class="card head"><div class="orb"></div><div><p class="mu">Analysis complete</p><h2>${esc(r.type)}</h2>  <p class="mu">${r.engine === 'ai' ? 'Analyzed with an AI provider' : 'Analyzed locally in your browser — no AI used'}</p></div><button class="btn btn-sm" data-a="understand" ${S.showUnderstand ? '' : ''}>${S.showUnderstand ? 'Hide explanation' : 'Help me understand this'}</button></section>
   <div class="stats"><div class="stat"><b>${r.words ? r.words.toLocaleString() : ns}</b><span>Target words</span></div><div class="stat"><b>${r.sources ?? ns}</b><span>Sources</span></div><div class="stat"><b>${esc(r.deadline || ns)}</b><span>Deadline</span></div></div>
   <section class="card"><h3>Important requirements</h3>${r.requirements.length ? `<ul class="reqs">${r.requirements.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '<p class="mu" style="margin-top:.6rem">Not specified</p>'}
   ${r.keywords.length ? `<div class="chips">${r.keywords.map(k => `<span>${esc(k)}</span>`).join('')}</div>` : ''}</section>
   <section class="card"><h3>Action plan</h3><div class="prog"><span>Progress</span><span id="pct">${pct(a)}%</span></div><div class="bar"><i id="bar" style="width:${pct(a)}%"></i></div>
-  <ul class="tasks">${r.tasks.map((t, i) => `<li class="${a.done[i] ? 'done' : ''}"><label><input type="checkbox" data-t="${i}" ${a.done[i] ? 'checked' : ''}><span>${esc(t)}</span></label></li>`).join('')}</ul></section>`;
+  <ul class="tasks">${r.tasks.map((t, i) => `<li class="${a.done[i] ? 'done' : ''}"><label><input type="checkbox" data-t="${i}" ${a.done[i] ? 'checked' : ''}><span>${esc(t)}</span></label></li>`).join('')}</ul></section>
+  ${S.showUnderstand ? understandSection(a) : ''}`;
 }
 
 function historyView() {
@@ -243,13 +275,46 @@ function adminView() {
   return out;
 }
 
+function understandSection(a) {
+  const factors = a.result.factors || [];
+  if (!factors.length) return '';
+  const nums = ['①', '②', '③', '④', '⑤'];
+  const parts = factors.map((f, i) => {
+    const taught = S.taught.has(f.id);
+    const answered = S.answers[f.id];
+    const isCorrect = answered === f.quiz.answer;
+    let html = `<div class="factor"><h4>${nums[i]} ${f.title}</h4><p class="mu">${f.detail}</p>`;
+    if (taught) {
+      html += `<div class="explain"><p>${f.explanation}</p><p class="quiz-q">${f.quiz.q}</p><div class="quiz-opts">`;
+      html += f.quiz.opts.map((opt, j) => {
+        let cls = ' btn-opt';
+        if (answered !== undefined) {
+          if (j === answered && j === f.quiz.answer) cls += ' correct';
+          else if (j === answered) cls += ' wrong';
+          else if (j === f.quiz.answer) cls += ' correct-dim';
+          else cls += ' dimmed';
+        }
+        return `<button class="btn${cls}" data-a="answer" data-f="${f.id}" data-v="${j}" ${answered !== undefined ? 'disabled' : ''}>${String.fromCharCode(65+j)}. ${opt}</button>`;
+      }).join('');
+      html += `</div>`;
+      if (answered !== undefined) html += `<p class="quiz-fb ${isCorrect ? 'ok' : 'bad'}">${isCorrect ? 'Correct! ' : 'Not quite. '}${f.quiz.exp}</p>`;
+      html += `</div>`;
+    } else {
+      html += `<button class="btn btn-sm" data-a="teach" data-f="${f.id}">Teach me</button>`;
+    }
+    html += `</div>`;
+    return html;
+  }).join('');
+  return `<section class="card"><h3>Understanding your assignment</h3><p class="mu" style="margin-top:.6rem">Five things to understand before you start.</p>${parts}</section>`;
+}
+
 function render() {
   const root = $('#app');
   if (S.fatal) root.innerHTML = `<p class="boot">${esc(S.fatal)}</p>`;
   else if (!S.ready) root.innerHTML = '<p class="boot">Loading StudyLens…</p>';
   else root.innerHTML = S.user ? shell(route()) : authView();
 }
-const go = () => { S.err = ''; S.msg = ''; render(); window.scrollTo(0, 0); };
+const go = () => { S.err = ''; S.msg = ''; S.showUnderstand = false; S.taught = new Set(); S.answers = {}; render(); window.scrollTo(0, 0); };
 const friendly = e => (e && e.friendly ? e.message : 'Something went wrong. Please try again.');
 
 async function run(fn) {
@@ -263,11 +328,13 @@ document.addEventListener('submit', e => {
   const v = Object.fromEntries(new FormData(f)), kind = f.dataset.form;
   if (kind === 'analyze') {
     S.draft = (v.text || '').trim();
+    S.showUnderstand = false; S.taught = new Set(); S.answers = {};
     if (!S.draft) { S.err = 'Please paste an assignment prompt first.'; return render(); }
     return run(async () => {
       const result = await analyze(S.draft);
       const item = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), createdAt: Date.now(), text: S.draft, result, done: result.tasks.map(() => false) };
-      await P.save(S.user.uid, item); S.cur = item; S.hist = [item, ...S.hist].slice(0, MAX_HISTORY);
+      S.cur = item; S.hist = [item, ...S.hist].slice(0, MAX_HISTORY);
+      try { await P.save(S.user.uid, item); } catch { S.err = 'Could not save to your account. Your analysis is shown above.'; }
     });
   }
   if (kind === 'profile') {
@@ -301,6 +368,10 @@ document.addEventListener('click', e => {
   if (a === 'tab') { S.tab = b.dataset.v; go(); }
   else if (a === 'logout') run(async () => { await P.logout(); location.hash = ''; });
   else if (a === 'open') { S.cur = S.hist.find(x => x.id === b.dataset.id) || null; S.draft = S.cur?.text || ''; location.hash = '#/dashboard'; go(); }
+  else if (a === 'demo') { S.draft = DEMO_PROMPT; render(); }
+  else if (a === 'understand') { S.showUnderstand = !S.showUnderstand; render(); if (S.showUnderstand) { const el = $('.factor'); if (el) el.scrollIntoView({ behavior: 'smooth' }); } }
+  else if (a === 'teach') { S.taught.add(b.dataset.f); render(); }
+  else if (a === 'answer') { S.answers[b.dataset.f] = +b.dataset.v; render(); }
 });
 
 document.addEventListener('change', async e => {
