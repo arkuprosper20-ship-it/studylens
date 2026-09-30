@@ -1,0 +1,12 @@
+{
+  "cleanUrls": true,
+  "headers": [
+    { "source": "/(.*)", "headers": [
+      { "key": "X-Content-Type-Options", "value": "nosniff" },
+      { "key": "X-Frame-Options", "value": "DENY" },
+      { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+      { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.googleapis.com wss://*.firebaseio.com; worker-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" }
+    ] },
+    { "source": "/sw.js", "headers": [ { "key": "Cache-Control", "value": "no-cache" } ] }
+  ]
+}
