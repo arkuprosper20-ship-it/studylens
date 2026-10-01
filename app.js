@@ -1,6 +1,9 @@
 'use strict';
 /* StudyLens — vanilla JS. Sections: config · analysis · auth/data providers · UI. */
 
+import { parseAssignmentDeadline, rebuildAssignmentPlan } from './studylens-analyzer.js';
+import { analyzeAssignmentWithModel, MAX_MODEL_INPUT_CHARS, MODEL_CONFIG, onDeviceModel } from './on-device-ai.js';
+
 // Production auth: paste your Firebase web config here (see README). null = local prototype mode.
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBvdq6jnAptb9LXY55GBrxc_heGJrRq6J4",
@@ -11,8 +14,6 @@ const FIREBASE_CONFIG = {
   appId: "1:64849933348:web:899cbbb5c678a87bfc14b1",
   measurementId: "G-VZWM75QS7J"
 };
-// Optional AI enhancement: async (text) => result object. null = local engine only.
-const AI_PROVIDER = null;
 const DEMO_PROMPT = 'Write a 1,500-word essay about climate change. Use at least 3 credible sources. Discuss two causes, explain the effects, propose solutions, and submit by Friday.';
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -93,16 +94,13 @@ function buildUnderstanding(r, text) {
 }
 // </analysis>
 
-function normalize(r, engine) {
-  const n = v => (Number.isFinite(+v) && +v > 0 ? +v : null);
-  const arr = v => (Array.isArray(v) ? v.map(String) : []);
-  const type = r?.type ? String(r.type) : 'General assignment', out = { type, words: n(r?.words), sources: n(r?.sources), deadline: r?.deadline ? String(r.deadline) : null, keywords: arr(r?.keywords), requirements: arr(r?.requirements), engine };
-  out.tasks = arr(r?.tasks).length ? arr(r.tasks) : buildTasks(type, out);
-  return out;
-}
 async function analyze(text) {
-  if (AI_PROVIDER) { try { return normalize(await AI_PROVIDER(text), 'ai'); } catch { /* fall back to the local engine */ } }
-  return analyzeLocal(text);
+  return analyzeAssignmentWithModel(text, { modelReady: M.status === 'ready' });
+}
+function displayAnalysis(analysis, text) {
+  const legacy = analyzeLocal(text);
+  return { ...analysis, words: analysis.length.words, deadline: analysis.deadline?.raw || analysis.deadlineText,
+    keywords: analysis.requirementDetails.map(item => item.text), tasks: analysis.tasks.map(task => task.label), factors: legacy.factors };
 }
 
 /* ---------- Providers: same interface for local prototype and Firebase ---------- */
@@ -191,12 +189,27 @@ async function firebaseProvider(cfg) {
 
 /* ---------- UI ---------- */
 let P;
-const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
-const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'admin'].includes(r) ? r : 'dashboard'; };
+const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: '', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
+const MODEL_CHOICE_KEY = 'studylens.model-choice.v1';
+const M = { supported: null, status: 'not-installed', prompt: false, progress: 0, progressText: '', error: '', bannerError: false, userInitiated: false };
+const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'settings', 'admin'].includes(r) ? r : 'dashboard'; };
 const initials = n => (n || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
 const fmt = ts => new Date(ts).toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
 const doneCount = a => a.done.filter(Boolean).length;
-const pct = a => Math.round(doneCount(a) / a.result.tasks.length * 100);
+const pct = a => a.result.tasks.length ? Math.round(doneCount(a) / a.result.tasks.length * 100) : 0;
+
+function saveModelChoice(choice) {
+  try { localStorage.setItem(MODEL_CHOICE_KEY, JSON.stringify({ choice, dismissedAt: Date.now() })); } catch { /* the model still works for this visit */ }
+}
+
+function modelBanner() {
+  if (M.prompt) return `<section class="model-banner" role="dialog" aria-label="On-device model choice">
+    <div><h2>Make StudyLens smarter on your device</h2><p>A small AI model downloads once (about ${MODEL_CONFIG.sizeMB} MB). AI analysis runs on this device; your text is not sent to an AI server. No API key is needed, and StudyLens works without it.</p></div>
+    <div class="btns"><button class="btn pri" data-a="enable-model">Download model</button><button class="btn" data-a="dismiss-model">Not now</button></div></section>`;
+  if (M.userInitiated && M.status === 'downloading') return `<section class="model-banner" role="status"><div><h3>Downloading ${esc(MODEL_CONFIG.label)}</h3><p class="mu">${esc(M.progressText || 'Preparing the on-device model…')}</p><div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}%</p></div><button class="btn btn-sm" data-a="cancel-model">Cancel</button></section>`;
+  if (M.bannerError) return `<section class="model-banner" role="alert"><div><h3>Model download didn’t finish</h3><p>${esc(M.error || 'Check your connection, available storage, and graphics support, then try again.')}</p></div><div class="btns"><button class="btn pri" data-a="enable-model">Retry</button><button class="btn" data-a="dismiss-model">Not now</button></div></section>`;
+  return '';
+}
 
 function authView() {
   const reg = S.tab === 'register';
@@ -214,14 +227,30 @@ function authView() {
 }
 
 function shell(page) {
-  const links = [['dashboard', 'Dashboard'], ['history', 'History'], ['account', 'Account'], ['admin', 'Admin']];
+  const links = [['dashboard', 'Dashboard'], ['history', 'History'], ['account', 'Account'], ['settings', 'Settings'], ['admin', 'Admin']];
   const a = (id, l) => `<a href="#/${id}" class="${page === id ? 'on' : ''}">${l}</a>`;
   return `<header class="top"><div class="brand"><span class="logo">S</span>StudyLens</div><nav>${links.map(([i, l]) => a(i, l)).join('')}<button data-a="logout">Log out</button></nav></header>
   <div class="shell"><aside class="side"><div class="brand"><span class="logo">S</span>StudyLens</div>
   <div class="me"><span class="av">${esc(initials(S.user.name))}</span><div><p>${esc(S.user.name || 'Student')}</p><p class="mu">${esc(S.user.email)}</p></div></div>
-  <nav class="nav">${a('dashboard', 'Dashboard')}${a('history', 'Assignment History')}${a('account', 'Account')}${a('admin', 'Admin')}</nav>
+  <nav class="nav">${a('dashboard', 'Dashboard')}${a('history', 'Assignment History')}${a('account', 'Account')}${a('settings', 'Settings')}${a('admin', 'Admin')}</nav>
   <div class="foot"><span class="mu"><i class="dot"></i>Offline-ready</span><button class="btn" data-a="logout">Log out</button></div></aside>
-  <main>${page === 'history' ? historyView() : page === 'account' ? accountView() : page === 'admin' ? adminView() : dashView()}</main></div>`;
+  <main>${page === 'history' ? historyView() : page === 'account' ? accountView() : page === 'settings' ? settingsView() : page === 'admin' ? adminView() : dashView()}</main></div>`;
+}
+
+function settingsView() {
+  const status = M.status === 'ready' ? 'Ready' : M.status === 'downloading' ? 'Downloading' : M.status === 'unsupported' ? 'Not supported on this device' : 'Not installed';
+  const action = M.status === 'ready'
+    ? '<button class="btn" data-a="redownload-model">Re-download</button><button class="btn danger" data-a="remove-model">Remove model</button>'
+    : M.status === 'downloading'
+      ? '<button class="btn" data-a="cancel-model">Cancel download</button>'
+      : M.status === 'unsupported'
+        ? '' : '<button class="btn pri" data-a="enable-model">Enable smarter analysis</button>';
+  const note = M.status === 'unsupported'
+    ? '<p class="note">Smarter analysis isn’t supported on this device. StudyLens still analyzes assignments and builds plans.</p>'
+    : '<p class="note">When enabled, the model runs on your device with no API key; assignment text is not sent to an AI server. Confirmed assignments may still sync to your account.</p>';
+  return `<h1>Settings</h1><section class="card model-settings"><div><h3>Smarter analysis</h3><p class="mu">${esc(MODEL_CONFIG.label)} · approximately ${MODEL_CONFIG.sizeMB} MB</p></div>
+    <p class="model-status">Model status: <b>${status}</b></p>${M.status === 'downloading' ? `<div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}% · ${esc(M.progressText)}</p>` : ''}
+    ${M.error && !M.bannerError ? `<p class="err" role="alert">${esc(M.error)}</p>` : ''}${note}<div class="btns">${action}</div></section>`;
 }
 
 function dashView() {
@@ -232,8 +261,40 @@ function dashView() {
 }
 
 function resultView(a) {
+  if (!a.analysis) return legacyResultView(a);
+  const r = a.result, analysis = a.analysis, ns = 'Not specified';
+  const tags = field => analysis.fieldSources?.[field] === 'on-device AI' ? '<span class="ai-tag">AI-assisted</span>' : '';
+  const field = (name, label, source, missing, control) => `<label class="summary-field ${missing ? 'field-missing' : ''}"><span>${label} ${tags(source)}</span>${control}</label>`;
+  const required = a.editRequirements || analysis.requirements || [], edits = a.edits || {};
+  const requirementInputs = required.map((item, index) => `<div class="requirement-edit"><input name="requirements" data-requirement="${index}" aria-label="Requirement ${index + 1}" value="${esc(item)}"><button class="btn btn-sm" type="button" data-a="remove-requirement" data-index="${index}" aria-label="Remove requirement ${index + 1}">Remove</button></div>`).join('');
+  return `<section class="card understood"><p class="mu">What we understood</p><h2>${analysis.isAssignment === false ? 'This may not be an assignment prompt' : 'Check the assignment details'}</h2>
+    ${analysis.isAssignment === false ? '<p class="warning-note">This doesn’t look like assignment instructions. Choose the type that best fits, or edit the details before building a plan.</p>' : ''}
+    ${analysis.inputTruncated ? `<p class="warning-note">The prompt is longer than ${MAX_MODEL_INPUT_CHARS.toLocaleString()} characters. Rules analyzed the full text; on-device AI saw only the first ${MAX_MODEL_INPUT_CHARS.toLocaleString()} characters.</p>` : ''}
+    <form class="summary-form" data-form="confirm-analysis">
+      ${field('type', 'Assignment type', 'type', analysis.typeConfidence < 0.7, `<select name="type" data-understood-field>${['Essay / Paper', 'Presentation', 'Coding Project', 'Lab Report', 'Other'].map(type => `<option ${(edits.type || analysis.type) === type ? 'selected' : ''}>${type}</option>`).join('')}</select>`)}
+      ${field('topic', 'Topic', 'topic', !analysis.topic, `<input name="topic" data-understood-field value="${esc(edits.topic ?? analysis.topic ?? '')}" placeholder="Not specified">`)}
+      <div class="summary-grid">
+        ${field('length', 'Word count', 'length', !analysis.length?.words, `<input name="words" data-understood-field type="number" min="50" max="50000" value="${esc(edits.words ?? analysis.length?.words ?? '')}" placeholder="Not specified">`)}
+        ${field('length', 'Pages', 'length', !analysis.length?.pages, `<input name="pages" data-understood-field type="number" min="1" max="200" value="${esc(edits.pages ?? analysis.length?.pages ?? '')}" placeholder="Not specified">`)}
+        ${field('length', 'Slides', 'length', !analysis.length?.slides, `<input name="slides" data-understood-field type="number" min="1" max="200" value="${esc(edits.slides ?? analysis.length?.slides ?? '')}" placeholder="Not specified">`)}
+        ${field('sources', 'Sources', 'sources', analysis.sources == null, `<input name="sources" data-understood-field type="number" min="0" max="50" value="${esc(edits.sources ?? analysis.sources ?? '')}" placeholder="Not specified">`)}
+      </div>
+      ${field('citationStyle', 'Citation style', 'citationStyle', !!analysis.sources && !analysis.citationStyle, `<input name="citationStyle" data-understood-field value="${esc(edits.citationStyle ?? analysis.citationStyle ?? '')}" placeholder="Not specified">`)}
+      ${field('deadline', 'Deadline text', 'deadline', !analysis.deadline || analysis.deadlineNeedsConfirmation, `<input name="deadlineText" data-understood-field value="${esc(edits.deadlineText ?? analysis.deadlineText ?? '')}" placeholder="Not specified">`)}
+      ${analysis.deadlineNeedsConfirmation ? '<p class="warning-note">Please confirm the exact date. This text could not be turned into a calendar date.</p>' : ''}
+      <div class="summary-field ${required.length < 2 ? 'field-missing' : ''}"><span>Requirements ${tags('requirements')}</span>${requirementInputs || '<p class="mu">No requirements detected.</p>'}<button class="btn btn-sm" type="button" data-a="add-requirement">Add requirement</button></div>
+      ${analysis.formatRules?.length ? `<div class="summary-field"><span>Format rules ${tags('formatRules')}</span><p>${analysis.formatRules.map(esc).join('<br>')}</p></div>` : ''}
+      ${analysis.otherInstructions?.length ? `<section class="other-instructions"><h3>Other instructions we found</h3><ul>${analysis.otherInstructions.map(item => `<li>${esc(item)}</li>`).join('')}</ul></section>` : ''}
+      <p class="err" role="alert">${esc(S.err)}</p><button class="btn pri" ${S.busy ? 'disabled' : ''}>${a.confirmed ? 'Update summary and rebuild plan' : 'Confirm details and build plan'}</button>
+    </form></section>
+    <div class="stats"><div class="stat"><b>${esc(analysis.length?.label || ns)}</b><span>Length</span></div><div class="stat"><b>${analysis.sources ?? ns}</b><span>Sources</span></div><div class="stat"><b>${esc(analysis.deadline?.label || (analysis.deadlineText ? 'Needs confirmation' : ns))}</b><span>Deadline</span></div></div>
+    ${a.confirmed ? `<section class="card"><h3>Action plan</h3><div class="prog"><span>Progress</span><span id="pct">${pct(a)}%</span></div><div class="bar"><i id="bar" style="width:${pct(a)}%"></i></div>
+      <ul class="tasks">${r.tasks.map((task, i) => `<li class="${a.done[i] ? 'done' : ''}"><label><input type="checkbox" data-t="${i}" ${a.done[i] ? 'checked' : ''}><span>${esc(task)}</span></label></li>`).join('')}</ul></section>${S.showUnderstand ? understandSection(a) : ''}` : ''}`;
+}
+
+function legacyResultView(a) {
   const r = a.result, ns = 'Not specified';
-  return `<section class="card head"><div class="orb"></div><div><p class="mu">Analysis complete</p><h2>${esc(r.type)}</h2>  <p class="mu">${r.engine === 'ai' ? 'Analyzed with an AI provider' : 'Analyzed locally in your browser — no AI used'}</p></div><button class="btn btn-sm" data-a="understand" ${S.showUnderstand ? '' : ''}>${S.showUnderstand ? 'Hide explanation' : 'Help me understand this'}</button></section>
+  return `<section class="card head"><div class="orb"></div><div><p class="mu">Analysis complete</p><h2>${esc(r.type)}</h2>  <p class="mu">${r.engine === 'ai' ? 'Analyzed with an AI provider' : 'Analyzed locally in your browser'}</p></div><button class="btn btn-sm" data-a="understand" ${S.showUnderstand ? '' : ''}>${S.showUnderstand ? 'Hide explanation' : 'Help me understand this'}</button></section>
   <div class="stats"><div class="stat"><b>${r.words ? r.words.toLocaleString() : ns}</b><span>Target words</span></div><div class="stat"><b>${r.sources ?? ns}</b><span>Sources</span></div><div class="stat"><b>${esc(r.deadline || ns)}</b><span>Deadline</span></div></div>
   <section class="card"><h3>Important requirements</h3>${r.requirements.length ? `<ul class="reqs">${r.requirements.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '<p class="mu" style="margin-top:.6rem">Not specified</p>'}
   ${r.keywords.length ? `<div class="chips">${r.keywords.map(k => `<span>${esc(k)}</span>`).join('')}</div>` : ''}</section>
@@ -308,11 +369,126 @@ function understandSection(a) {
   return `<section class="card"><h3>Understanding your assignment</h3><p class="mu" style="margin-top:.6rem">Five things to understand before you start.</p>${parts}</section>`;
 }
 
+async function loadModelFromConsent() {
+  saveModelChoice('accepted');
+  M.prompt = false; M.status = 'downloading'; M.error = ''; M.bannerError = false; M.userInitiated = true; M.progress = 0;
+  render();
+  try {
+    let shown = -1;
+    await onDeviceModel.load(progress => {
+      M.progress = progress.progress; M.progressText = progress.text;
+      const percent = Math.round(M.progress * 100);
+      if (percent !== shown) { shown = percent; render(); }
+    });
+    M.status = 'ready'; M.error = ''; M.bannerError = false; M.userInitiated = false;
+  } catch (error) {
+    const canceled = /canceled/i.test(error?.message || '');
+    M.status = 'not-installed'; M.userInitiated = false;
+    if (canceled) saveModelChoice('declined');
+    else {
+      M.error = 'The model could not be loaded. Check your connection, available storage, and graphics support, then retry.';
+      M.bannerError = true;
+    }
+  }
+  render();
+}
+
+async function removeModel() {
+  M.status = 'downloading'; M.error = ''; M.bannerError = false; M.userInitiated = false; render();
+  try {
+    await onDeviceModel.remove();
+    saveModelChoice('declined'); M.status = 'not-installed'; M.progress = 0;
+  } catch {
+    M.status = 'ready'; M.error = 'The model could not be removed from this browser. Try again from Settings.';
+  }
+  render();
+}
+
+async function initializeModel() {
+  let adapter = null;
+  try { adapter = await globalThis.navigator?.gpu?.requestAdapter(); } catch { /* unavailable */ }
+  M.supported = !!adapter;
+  if (!M.supported) { M.status = 'unsupported'; M.prompt = false; render(); return; }
+  let choice = null;
+  try { choice = JSON.parse(localStorage.getItem(MODEL_CHOICE_KEY) || 'null')?.choice || null; } catch { /* treat as first visit */ }
+  if (choice === 'declined') { M.prompt = false; M.status = 'not-installed'; render(); return; }
+  if (choice === 'accepted') {
+    M.prompt = false;
+    try {
+      if (await onDeviceModel.isCached()) {
+        M.status = 'downloading';
+        let shown = -1;
+        await onDeviceModel.load(progress => {
+          M.progress = progress.progress; M.progressText = progress.text;
+          const percent = Math.round(M.progress * 100);
+          if (percent !== shown) { shown = percent; render(); }
+        });
+        M.status = 'ready';
+      }
+    } catch {
+      M.status = 'not-installed';
+      M.error = 'The saved model could not be loaded. Retry from Settings.';
+    }
+    render(); return;
+  }
+  M.prompt = true;
+  render();
+}
+
+function confirmAnalysis(item, values, requirements) {
+  const integer = (name, min, max) => {
+    const raw = String(values[name] ?? '').trim();
+    if (!raw) return { value: null, invalid: false };
+    const value = Number(raw);
+    return { value, invalid: !Number.isInteger(value) || value < min || value > max };
+  };
+  const words = integer('words', 50, 50000), slides = integer('slides', 1, 200), sources = integer('sources', 0, 50);
+  const pagesRaw = String(values.pages || '').trim();
+  const pagesMatch = pagesRaw.match(/^(\d+)(?:\s*(?:-|–|to)\s*(\d+))?$/i);
+  if (words.invalid || slides.invalid || sources.invalid || (pagesRaw && (!pagesMatch || +pagesMatch[1] < 1 || +pagesMatch[1] > 200 || (pagesMatch[2] && (+pagesMatch[2] < +pagesMatch[1] || +pagesMatch[2] > 200))))) {
+    S.err = 'Check the numbers: words 50–50,000, pages/slides 1–200, sources 0–50.'; render(); return false;
+  }
+  const original = item.analysis;
+  const analysis = { ...original, length: { ...original.length }, fieldSources: { ...original.fieldSources } };
+  analysis.type = values.type;
+  analysis.topic = String(values.topic || '').trim() || null;
+  analysis.length.words = words.value;
+  analysis.length.target = words.value;
+  analysis.length.minWords = null; analysis.length.maxWords = null; analysis.length.qualifier = null;
+  analysis.length.pages = pagesMatch ? (pagesMatch[2] ? `${pagesMatch[1]}–${pagesMatch[2]}` : Number(pagesMatch[1])) : null;
+  analysis.length.slides = slides.value;
+  analysis.length.minutes = original.length.minutes;
+  analysis.length.label = [words.value ? `${words.value.toLocaleString()} words` : null,
+    analysis.length.pages ? `${analysis.length.pages} pages` : null, slides.value ? `${slides.value} slides` : null,
+    analysis.length.minutes ? `${analysis.length.minutes} min` : null].filter(Boolean).join(' · ') || null;
+  analysis.wordCount = words.value;
+  analysis.sources = sources.value;
+  analysis.citationStyle = String(values.citationStyle || '').trim() || null;
+  analysis.deadlineText = String(values.deadlineText || '').trim() || null;
+  analysis.deadline = analysis.deadlineText ? parseAssignmentDeadline(analysis.deadlineText) : null;
+  analysis.deadlineNeedsConfirmation = !!analysis.deadlineText && !analysis.deadline;
+  analysis.requirements = requirements.map(value => value.trim()).filter(Boolean);
+  const priorDetails = new Map((original.requirementDetails || []).map(detail => [detail.text.toLowerCase(), detail]));
+  analysis.requirementDetails = analysis.requirements.map(text => priorDetails.get(text.toLowerCase()) || { text, category: 'content' });
+  analysis.missing = [...(original.missing || [])].filter(field => !(field === 'length' && analysis.length.label) && !(field === 'deadline' && analysis.deadline));
+  if (!analysis.length.label && !analysis.missing.includes('length')) analysis.missing.push('length');
+  if (!analysis.deadline && !analysis.missing.includes('deadline')) analysis.missing.push('deadline');
+  analysis.warnings = [...(original.warnings || [])].filter(warning => !(analysis.length.label && warning.startsWith('No length requirement')) && !(analysis.deadline && warning.startsWith('No deadline found')) && !warning.startsWith('The deadline text is vague'));
+  if (analysis.deadlineNeedsConfirmation) analysis.warnings.push('The deadline text is vague — confirm the exact date before relying on the schedule.');
+  item.analysis = rebuildAssignmentPlan(analysis);
+  item.result = displayAnalysis(item.analysis, item.text);
+  item.done = item.result.tasks.map(() => false);
+  item.confirmed = true;
+  item.editRequirements = [...item.analysis.requirements];
+  item.edits = {};
+  return true;
+}
+
 function render() {
   const root = $('#app');
   if (S.fatal) root.innerHTML = `<p class="boot">${esc(S.fatal)}</p>`;
   else if (!S.ready) root.innerHTML = '<p class="boot">Loading StudyLens…</p>';
-  else root.innerHTML = S.user ? shell(route()) : authView();
+  else root.innerHTML = modelBanner() + (S.user ? shell(route()) : authView());
 }
 const go = () => { S.err = ''; S.msg = ''; S.showUnderstand = false; S.taught = new Set(); S.answers = {}; render(); window.scrollTo(0, 0); };
 const friendly = e => (e && e.friendly ? e.message : 'Something went wrong. Please try again.');
@@ -325,16 +501,23 @@ async function run(fn) {
 
 document.addEventListener('submit', e => {
   const f = e.target.closest('[data-form]'); if (!f) return; e.preventDefault();
-  const v = Object.fromEntries(new FormData(f)), kind = f.dataset.form;
+  const formData = new FormData(f), v = Object.fromEntries(formData), kind = f.dataset.form;
   if (kind === 'analyze') {
     S.draft = (v.text || '').trim();
     S.showUnderstand = false; S.taught = new Set(); S.answers = {};
     if (!S.draft) { S.err = 'Please paste an assignment prompt first.'; return render(); }
     return run(async () => {
-      const result = await analyze(S.draft);
-      const item = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), createdAt: Date.now(), text: S.draft, result, done: result.tasks.map(() => false) };
-      S.cur = item; S.hist = [item, ...S.hist].slice(0, MAX_HISTORY);
-      try { await P.save(S.user.uid, item); } catch { S.err = 'Could not save to your account. Your analysis is shown above.'; }
+      const analysis = await analyze(S.draft), result = displayAnalysis(analysis, S.draft);
+      S.cur = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), createdAt: Date.now(), text: S.draft,
+        analysis, result, done: [], confirmed: false, editRequirements: [...analysis.requirements], edits: {} };
+    });
+  }
+  if (kind === 'confirm-analysis') {
+    if (!S.cur?.analysis) return;
+    return run(async () => {
+      if (!confirmAnalysis(S.cur, v, formData.getAll('requirements'))) return;
+      S.hist = [S.cur, ...S.hist.filter(item => item.id !== S.cur.id)].slice(0, MAX_HISTORY);
+      try { await P.save(S.user.uid, S.cur); } catch { S.err = 'Could not save to your account. Your plan is shown above.'; }
     });
   }
   if (kind === 'profile') {
@@ -369,6 +552,13 @@ document.addEventListener('click', e => {
   else if (a === 'logout') run(async () => { await P.logout(); location.hash = ''; });
   else if (a === 'open') { S.cur = S.hist.find(x => x.id === b.dataset.id) || null; S.draft = S.cur?.text || ''; location.hash = '#/dashboard'; go(); }
   else if (a === 'demo') { S.draft = DEMO_PROMPT; render(); }
+  else if (a === 'enable-model') loadModelFromConsent();
+  else if (a === 'dismiss-model') { saveModelChoice('declined'); M.prompt = false; M.bannerError = false; M.userInitiated = false; render(); }
+  else if (a === 'cancel-model') { onDeviceModel.cancel(); saveModelChoice('declined'); M.status = 'not-installed'; M.bannerError = false; M.userInitiated = false; render(); }
+  else if (a === 'remove-model') removeModel();
+  else if (a === 'redownload-model') onDeviceModel.remove().then(() => loadModelFromConsent()).catch(() => { M.error = 'The model could not be cleared for a fresh download.'; render(); });
+  else if (a === 'add-requirement' && S.cur?.analysis) { S.cur.editRequirements ||= [...S.cur.analysis.requirements]; S.cur.editRequirements.push(''); render(); }
+  else if (a === 'remove-requirement' && S.cur?.analysis) { S.cur.editRequirements.splice(+b.dataset.index, 1); render(); }
   else if (a === 'understand') { S.showUnderstand = !S.showUnderstand; render(); if (S.showUnderstand) { const el = $('.factor'); if (el) el.scrollIntoView({ behavior: 'smooth' }); } }
   else if (a === 'teach') { S.taught.add(b.dataset.f); render(); }
   else if (a === 'answer') { S.answers[b.dataset.f] = +b.dataset.v; render(); }
@@ -381,12 +571,21 @@ document.addEventListener('change', async e => {
   $('#pct').textContent = pct(cur) + '%'; $('#bar').style.width = pct(cur) + '%';
   try { await P.save(S.user.uid, cur); } catch { S.err = 'Could not save your progress. Check your connection.'; c.checked = !c.checked; cur.done[+c.dataset.t] = c.checked; render(); }
 });
-document.addEventListener('input', e => { if (e.target.name === 'text') S.draft = e.target.value; });
+document.addEventListener('input', e => {
+  if (e.target.name === 'text') S.draft = e.target.value;
+  if (e.target.hasAttribute('data-understood-field') && S.cur?.analysis) {
+    S.cur.edits ||= {}; S.cur.edits[e.target.name] = e.target.value;
+  }
+  if (e.target.hasAttribute('data-requirement') && S.cur?.analysis) {
+    S.cur.editRequirements[+e.target.dataset.requirement] = e.target.value;
+  }
+});
 window.addEventListener('hashchange', go);
 
 (async function init() {
   try { P = FIREBASE_CONFIG ? await firebaseProvider(FIREBASE_CONFIG) : localProvider(); }
   catch (e) { console.error(e); S.fatal = 'Sign-in service is unavailable. Please try again later.'; return render(); }
+  initializeModel();
   let last = null;
   P.onChange(async u => {
     if (u && u.uid !== last) S.hist = await P.list(u.uid).catch(() => []);

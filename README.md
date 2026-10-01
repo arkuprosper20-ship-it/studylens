@@ -5,10 +5,32 @@ Paste an assignment prompt; get its type, word count, source requirement, deadli
 **Problem:** students get complicated instructions and don't know where to start. **Solution:** requirements + deadline + resources + action plan + progress tracker.
 
 ## Honest about AI
-The core runs on a local, in-browser engine (regex, keyword detection, classification, task generation). No API key is needed and no AI is used. `AI_PROVIDER` in `app.js` is an optional hook: if you supply one it must return the same result shape; on failure the local engine takes over, and the UI states which engine produced each result.
+StudyLens analyzes assignment instructions with its rules-based analyzer first. With the student's explicit opt-in, it can also download the pinned WebLLM Qwen2.5 0.5B model (about 266 MB) and run it in a browser worker. AI inference stays on the device; it does not send prompt text to an AI server and needs no API key or third-party inference service. The model is used only to suggest details the rules miss, and the user confirms the editable summary before a plan is built. Without opting in, assignment analysis and planning continue to work. Separately, confirmed assignments may sync to the user's account through the app's existing Firebase storage configuration.
+
+### On-device analysis
+- The first-visit prompt never downloads anything until **Download model** is clicked. The choice is saved in local storage; Settings can enable, remove, or re-download the model.
+- WebLLM caches the model in the browser. After prior consent, StudyLens checks that cache and loads it in the background. WebGPU is required; unsupported browsers keep the normal assignment workflow.
+- Rules run first. The model is called only when confidence is low or details are missing, and suggestions are checked against the source text and confirmed by the student. The model does not supply a trusted deadline: vague dates must be confirmed.
+- The prompt sent to the model is capped at 8,000 characters. If longer, rules still analyze the complete prompt and the summary shows what was truncated for the model.
+- To switch models, change `MODEL_CONFIG` in `on-device-ai.js` to another model ID present in the pinned `@mlc-ai/web-llm` package's `prebuiltAppConfig.model_list`, and update its approximate `sizeMB` and display `label` in that same constant.
+- WebLLM's package code is bundled into the app locally. The only model-specific network activity is the user's one-time model download; no CDN inference runtime is used.
+
+Acceptance coverage: `npm test` exercises rules-first behavior, model skip/merge/fallback, vague deadlines, prompt-injection handling, and the model ID. Browser-specific consent, WebGPU, cache persistence, and offline-after-install checks still require a WebGPU-capable browser and are listed under [Verification](#verification).
+
+### Verification
+Manual browser checks:
+1. In a fresh browser profile with WebGPU, confirm the consent prompt appears and no model files load before clicking **Download model**.
+2. Choose **Not now** and confirm analysis/planning still work; Settings offers **Enable smarter analysis** and there is no repeated prompt in the same session.
+3. Opt in, confirm download progress/cancel, then **Ready**. Reload and confirm no prompt appears and the cached model loads.
+4. In a browser without WebGPU, confirm there is no prompt and Settings explains support is unavailable.
+5. After installation, go offline and confirm on-device analysis still runs.
+6. Confirm the climate-change example returns its same rules result without a model call.
+7. Confirm the vague volcano report fills supported details but asks the user to confirm its deadline.
+8. Confirm prompt-injection text is treated as assignment data, not an instruction to the model.
+9. Simulate a model error or invalid response and confirm the rules result remains available.
 
 ## Run / deploy
-Static site, no build. Locally: `python3 -m http.server` and open localhost. Vercel: import the folder (framework: Other). `vercel.json` adds security headers and a CSP.
+The deployed app is static, but its production bundle is built with Vite to resolve and package WebLLM locally. End users do not need npm. For local development, install the pinned dependencies once with `npm ci`, then use `npm run dev`; run `npm test` and `npm run build` before deployment. Vercel can run the configured `npm run build` during deploy and publishes `dist`. `vercel.json` adds security headers and a CSP.
 
 ## Authentication
 - **Local prototype mode** (default, `FIREBASE_CONFIG = null`): accounts live in this browser's localStorage, passwords are salted PBKDF2 hashes. **This is a demonstration, not production authentication** — anyone with access to the browser profile can read the data.
