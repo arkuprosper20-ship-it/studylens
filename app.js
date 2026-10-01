@@ -190,9 +190,11 @@ async function firebaseProvider(cfg) {
 /* ---------- UI ---------- */
 let P;
 const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: '', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
+const ADMIN_UID = 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1';
 const MODEL_CHOICE_KEY = 'studylens.model-choice.v1';
 const M = { supported: null, status: 'not-installed', prompt: false, progress: 0, progressText: '', error: '', bannerError: false, userInitiated: false };
-const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'settings', 'admin'].includes(r) ? r : 'dashboard'; };
+const isAdmin = () => S.user?.uid === ADMIN_UID;
+const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'settings', 'admin'].includes(r) && (r !== 'admin' || isAdmin()) ? r : 'dashboard'; };
 const initials = n => (n || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
 const fmt = ts => new Date(ts).toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
 const doneCount = a => a.done.filter(Boolean).length;
@@ -227,12 +229,13 @@ function authView() {
 }
 
 function shell(page) {
-  const links = [['dashboard', 'Dashboard'], ['history', 'History'], ['account', 'Account'], ['settings', 'Settings'], ['admin', 'Admin']];
+  const links = [['dashboard', 'Dashboard'], ['history', 'History'], ['account', 'Account'], ['settings', 'Settings'], ...(isAdmin() ? [['admin', 'Admin']] : [])];
   const a = (id, l) => `<a href="#/${id}" class="${page === id ? 'on' : ''}">${l}</a>`;
-  return `<header class="top"><div class="brand"><span class="logo">S</span>StudyLens</div><nav>${links.map(([i, l]) => a(i, l)).join('')}<button data-a="logout">Log out</button></nav></header>
+  const nav = links.map(([i, l]) => a(i, l)).join('');
+  return `<header class="top"><div class="brand"><span class="logo">S</span>StudyLens</div><nav>${nav}<button data-a="logout">Log out</button></nav></header>
   <div class="shell"><aside class="side"><div class="brand"><span class="logo">S</span>StudyLens</div>
   <div class="me"><span class="av">${esc(initials(S.user.name))}</span><div><p>${esc(S.user.name || 'Student')}</p><p class="mu">${esc(S.user.email)}</p></div></div>
-  <nav class="nav">${a('dashboard', 'Dashboard')}${a('history', 'Assignment History')}${a('account', 'Account')}${a('settings', 'Settings')}${a('admin', 'Admin')}</nav>
+  <nav class="nav">${nav}</nav>
   <div class="foot"><span class="mu"><i class="dot"></i>Offline-ready</span><button class="btn" data-a="logout">Log out</button></div></aside>
   <main>${page === 'history' ? historyView() : page === 'account' ? accountView() : page === 'settings' ? settingsView() : page === 'admin' ? adminView() : dashView()}</main></div>`;
 }
@@ -315,6 +318,7 @@ function accountView() {
 }
 
 function adminView() {
+  if (!isAdmin()) return '<h1>Page not found</h1>';
   const u = S.adminUser;
   let out = `<h1>Admin lookup</h1>
   <form class="card form" data-form="admin" novalidate>
@@ -526,6 +530,7 @@ document.addEventListener('submit', e => {
     return run(async () => { await P.updateName(S.user.uid, name); S.msg = 'Profile saved.'; });
   }
   if (kind === 'admin') {
+    if (!isAdmin()) { location.hash = '#/dashboard'; return; }
     const uid = (v.uid || '').trim();
     if (!uid) { S.err = 'Please enter a UID.'; return render(); }
     return run(async () => {

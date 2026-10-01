@@ -3,7 +3,7 @@ service cloud.firestore {
   match /databases/{db}/documents {
     function isAdmin() {
       return request.auth != null
-        && get(/databases/$(db)/documents/users/$(request.auth.uid)).data.role == 'admin';
+        && request.auth.uid == 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1';
     }
     match /users/{uid} {
       allow create: if request.auth != null
