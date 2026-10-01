@@ -1,4 +1,4 @@
-const C = "studylens-v2";
+const C = "studylens-v3";
 const A = ["./", "index.html"];
 self.addEventListener("install", (event) => event.waitUntil(caches.open(C).then((cache) => cache.addAll(A)).then(() => self.skipWaiting())));
 self.addEventListener("activate", (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith("studylens-") && key !== C).map((key) => caches.delete(key)))).then(() => clients.claim())));
