@@ -2,7 +2,9 @@
 /* StudyLens — vanilla JS. Sections: config · analysis · auth/data providers · UI. */
 
 import { parseAssignmentDeadline, rebuildAssignmentPlan } from './studylens-analyzer.js';
-import { analyzeAssignmentWithModel, MAX_MODEL_INPUT_CHARS, MODEL_CONFIG, onDeviceModel } from './on-device-ai.js';
+import { analyzeAssignmentWithModel, MAX_MODEL_INPUT_CHARS, MODEL_CONFIG, MODEL_REGISTRY, getModelById, onDeviceModel } from './on-device-ai.js';
+import { detectDeviceCapabilities } from './studylens-device.js';
+import { getCompatibleModels, selectBestModel } from './studylens-model-selector.js';
 
 // Production auth: paste your Firebase web config here (see README). null = local prototype mode.
 const FIREBASE_CONFIG = {
@@ -192,23 +194,36 @@ let P;
 const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: '', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
 const ADMIN_UID = 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1';
 const MODEL_CHOICE_KEY = 'studylens.model-choice.v1';
-const M = { supported: null, status: 'not-installed', prompt: false, progress: 0, progressText: '', error: '', bannerError: false, userInitiated: false };
+const MODEL_SETTINGS_KEY = 'studylens.model-settings.v2';
+const M = { supported: null, deviceTier: null, status: 'not-installed', prompt: false, recommendedModel: null, progress: 0, progressText: '', error: '', bannerError: false, userInitiated: false, activeModel: null, modelStatus: {}, preference: 'automatic' };
 const isAdmin = () => S.user?.uid === ADMIN_UID;
 const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'settings', 'admin'].includes(r) && (r !== 'admin' || isAdmin()) ? r : 'dashboard'; };
 const initials = n => (n || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
 const fmt = ts => new Date(ts).toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
 const doneCount = a => a.done.filter(Boolean).length;
 const pct = a => a.result.tasks.length ? Math.round(doneCount(a) / a.result.tasks.length * 100) : 0;
-
+const isModelReady = () => onDeviceModel.getActiveModel() && M.modelStatus[onDeviceModel.getActiveModel()] === 'ready';
+const saveModelSettings = (settings) => { try { localStorage.setItem(MODEL_SETTINGS_KEY, JSON.stringify(settings)); } catch { /* best-effort */ } };
+function loadModelSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(MODEL_SETTINGS_KEY) || 'null');
+    if (s) return s;
+    const old = JSON.parse(localStorage.getItem(MODEL_CHOICE_KEY) || 'null');
+    if (old) return { choice: old.choice, preference: 'automatic', activeModel: null, dismissedAt: old.dismissedAt };
+  } catch { }
+  return null;
+}
 function saveModelChoice(choice) {
-  try { localStorage.setItem(MODEL_CHOICE_KEY, JSON.stringify({ choice, dismissedAt: Date.now() })); } catch { /* the model still works for this visit */ }
+  saveModelSettings({ choice, preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() });
 }
 
 function modelBanner() {
+  const model = M.recommendedModel || MODEL_CONFIG;
   if (M.prompt) return `<section class="model-banner" role="dialog" aria-label="On-device model choice">
-    <div><h2>Make StudyLens smarter on your device</h2><p>A small AI model downloads once (about ${MODEL_CONFIG.sizeMB} MB). AI analysis runs on this device; your text is not sent to an AI server. No API key is needed, and StudyLens works without it.</p></div>
+    <div><h2>Make StudyLens smarter on your device</h2><p>A small AI model downloads once (about ${model.sizeMB} MB). AI analysis runs on this device; your text is not sent to an AI server. No API key is needed, and StudyLens works without it.</p>
+    <p class="note">Recommended for your device: ${model.name}. <a href="#/settings" class="mu">Choose a different model</a>.</p></div>
     <div class="btns"><button class="btn pri" data-a="enable-model">Download model</button><button class="btn" data-a="dismiss-model">Not now</button></div></section>`;
-  if (M.userInitiated && M.status === 'downloading') return `<section class="model-banner" role="status"><div><h3>Downloading ${esc(MODEL_CONFIG.name || MODEL_CONFIG.label)}</h3><p class="mu">${esc(M.progressText || 'Preparing the on-device model…')}</p><div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}%</p></div><button class="btn btn-sm" data-a="cancel-model">Cancel</button></section>`;
+  if (M.userInitiated && M.status === 'downloading') return `<section class="model-banner" role="status"><div><h3>Downloading ${esc(model.name)}</h3><p class="mu">${esc(M.progressText || 'Preparing the on-device model…')}</p><div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}%</p></div><button class="btn btn-sm" data-a="cancel-model">Cancel</button></section>`;
   if (M.bannerError) return `<section class="model-banner" role="alert"><div><h3>Model download didn’t finish</h3><p>${esc(M.error || 'Check your connection, available storage, and graphics support, then try again.')}</p></div><div class="btns"><button class="btn pri" data-a="enable-model">Retry</button><button class="btn" data-a="dismiss-model">Not now</button></div></section>`;
   return '';
 }
@@ -241,19 +256,71 @@ function shell(page) {
 }
 
 function settingsView() {
-  const status = M.status === 'ready' ? 'Ready' : M.status === 'downloading' ? 'Downloading' : M.status === 'unsupported' ? 'Not supported on this device' : 'Not installed';
-  const action = M.status === 'ready'
-    ? '<button class="btn" data-a="redownload-model">Re-download</button><button class="btn danger" data-a="remove-model">Remove model</button>'
-    : M.status === 'downloading'
-      ? '<button class="btn" data-a="cancel-model">Cancel download</button>'
-      : M.status === 'unsupported'
-        ? '' : '<button class="btn pri" data-a="enable-model">Enable smarter analysis</button>';
-  const note = M.status === 'unsupported'
-    ? '<p class="note">Smarter analysis isn’t supported on this device. StudyLens still analyzes assignments and builds plans.</p>'
-    : '<p class="note">When enabled, the model runs on your device with no API key; assignment text is not sent to an AI server. Confirmed assignments may still sync to your account.</p>';
-  return `<h1>Settings</h1><section class="card model-settings"><div><h3>Smarter analysis</h3><p class="mu">${esc(MODEL_CONFIG.name || MODEL_CONFIG.label)} · approximately ${MODEL_CONFIG.sizeMB} MB</p></div>
-    <p class="model-status">Model status: <b>${status}</b></p>${M.status === 'downloading' ? `<div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}% · ${esc(M.progressText)}</p>` : ''}
-    ${M.error && !M.bannerError ? `<p class="err" role="alert">${esc(M.error)}</p>` : ''}${note}<div class="btns">${action}</div></section>`;
+  const pref = M.preference || 'automatic';
+  const refreshModelStatus = async () => {
+    for (const model of MODEL_REGISTRY) {
+      if (M.supported && !M.modelStatus[model.id]) {
+        try { M.modelStatus[model.id] = await onDeviceModel.isCached(model.id) ? 'ready' : 'not-installed'; }
+        catch { M.modelStatus[model.id] = 'not-installed'; }
+      }
+    }
+    render();
+  };
+  // Show current status synchronously; refresh asynchronously
+  let modelsHtml = '';
+  for (const model of MODEL_REGISTRY) {
+    const st = M.modelStatus[model.id] || (M.supported ? 'checking' : 'unavailable');
+    const isActive = onDeviceModel.getActiveModel() === model.id;
+    const isDownloading = onDeviceModel.getLoadingModel() === model.id;
+    let label, cls, actions;
+    if (isActive && st === 'ready') { label = 'Active'; cls = 'status-ready'; }
+    else if (isDownloading) { label = 'Downloading…'; cls = 'status-downloading'; }
+    else if (st === 'ready') { label = 'Downloaded'; cls = 'status-ready'; }
+    else if (st === 'not-installed') { label = 'Not installed'; cls = 'status-not-installed'; }
+    else if (st === 'unavailable') { label = 'Not supported'; cls = 'status-not-installed'; }
+    else { label = 'Checking…'; cls = 'status-not-installed'; }
+    if (isDownloading) {
+      actions = `<div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><button class="btn btn-sm" data-a="cancel-model" data-model="${model.id}">Cancel</button>`;
+    } else if (st === 'not-installed' && M.supported) {
+      actions = `<button class="btn btn-sm pri" data-a="download-model" data-model="${model.id}">Download (${model.sizeMB} MB)</button>`;
+    } else if (st === 'ready' && !isActive) {
+      actions = `<button class="btn btn-sm" data-action="switch-model" data-model="${model.id}">Switch to</button><button class="btn btn-sm danger" data-a="remove-model" data-model="${model.id}">Remove</button>`;
+    } else if (st === 'ready' && isActive) {
+      actions = `<button class="btn btn-sm danger" data-a="remove-model" data-model="${model.id}">Remove</button>`;
+    } else {
+      actions = '';
+    }
+    const recommended = M.recommendedModel?.id === model.id ? ' <span class="ai-tag">Recommended</span>' : '';
+    modelsHtml += `<div class="model-item"><div><b>${model.name}</b>${recommended}<span class="mu">${model.id} · ${model.sizeMB} MB</span><div class="model-status ${cls}">${label}</div></div>${actions ? `<div class="model-actions">${actions}</div>` : ''}</div>`;
+  }
+  if (!M.supported) {
+    modelsHtml = '<p class="mu">WebGPU is not available on this device. StudyLens uses its rules-based analyzer instead.</p>';
+  } else {
+    refreshModelStatus();
+  }
+  const note = M.supported
+    ? '<p class="note">When enabled, the model runs on your device with no API key; assignment text is not sent to an AI server. Models are cached by your browser and work offline after download.</p>'
+    : '<p class="note">Smarter analysis isn’t supported on this device. StudyLens still analyzes assignments and builds plans.</p>';
+  const tech = M.supported ? `<details class="tech-details"><summary class="mu">Technical details</summary>
+    <p class="mu" style="font-size:.8rem">Device tier: <b>${M.deviceTier || '—'}</b></p>
+    <p class="mu" style="font-size:.8rem">Active model: <b>${onDeviceModel.getActiveModel() || 'none'}</b></p>
+    <p class="mu" style="font-size:.8rem">WebGPU adapter: ${M.deviceTier ? 'available' : 'unavailable'}</p></details>` : '';
+  return `<h1>Settings</h1><section class="card model-settings">
+    <div><h3>On-device AI</h3><p class="mu">StudyLens analyzes assignments with its rules engine first, then uses an optional AI model to fill gaps. All AI runs locally — no API key, no cloud inference.</p></div>
+    <label>Model preference${M.supported ? '' : ' (unavailable)'}
+      <select name="model-preference" data-set-pref ${M.supported ? '' : 'disabled'}>
+        <option value="automatic" ${pref === 'automatic' ? 'selected' : ''}>Automatic — StudyLens chooses</option>
+        <option value="small" ${pref === 'small' ? 'selected' : ''}>Small (Qwen2.5 0.5B, ~266 MB)</option>
+        <option value="medium" ${pref === 'medium' ? 'selected' : ''}>Medium (Qwen2.5 1.5B, ~766 MB)</option>
+        <option value="large" ${pref === 'large' ? 'selected' : ''}>Advanced (Qwen2.5 3B, ~1.5 GB)</option>
+      </select>
+    </label>
+    <p class="note">StudyLens recommends: <b>${(M.recommendedModel || MODEL_CONFIG).name}</b> for your device.</p>
+    <h4>Available models</h4>
+    ${modelsHtml}
+    ${M.error && !M.bannerError ? `<p class="err" role="alert">${esc(M.error)}</p>` : ''}${tech}
+    ${note}<div class="btns">${M.supported && !onDeviceModel.getActiveModel() && onDeviceModel.getLoadingModel() === null ? `<button class="btn pri" data-a="enable-model">Download ${M.recommendedModel?.name || MODEL_CONFIG.name}</button>` : ''}</div>
+    </section>`;
 }
 
 function dashView() {
@@ -373,22 +440,24 @@ function understandSection(a) {
   return `<section class="card"><h3>Understanding your assignment</h3><p class="mu" style="margin-top:.6rem">Five things to understand before you start.</p>${parts}</section>`;
 }
 
-async function loadModelFromConsent() {
-  saveModelChoice('accepted');
-  M.prompt = false; M.status = 'downloading'; M.error = ''; M.bannerError = false; M.userInitiated = true; M.progress = 0;
+async function loadModelFromConsent(modelId) {
+  modelId = modelId || M.recommendedModel?.id || MODEL_CONFIG.id;
+  const model = getModelById(modelId) || MODEL_CONFIG;
+  saveModelSettings({ choice: 'accepted', preference: M.preference, activeModel: modelId, dismissedAt: Date.now() });
+  M.prompt = false; M.status = 'downloading'; M.error = ''; M.bannerError = false; M.userInitiated = true; M.progress = 0; M.modelStatus[modelId] = 'downloading';
   render();
   try {
     let shown = -1;
-    await onDeviceModel.load(MODEL_CONFIG.id, progress => {
+    await onDeviceModel.load(modelId, progress => {
       M.progress = progress.progress; M.progressText = progress.text;
       const percent = Math.round(M.progress * 100);
       if (percent !== shown) { shown = percent; render(); }
     });
-    M.status = 'ready'; M.error = ''; M.bannerError = false; M.userInitiated = false;
+    M.status = 'ready'; M.error = ''; M.bannerError = false; M.userInitiated = false; M.activeModel = modelId; M.modelStatus[modelId] = 'ready';
   } catch (error) {
     const canceled = /canceled/i.test(error?.message || '');
-    M.status = 'not-installed'; M.userInitiated = false;
-    if (canceled) saveModelChoice('declined');
+    M.status = 'not-installed'; M.userInitiated = false; M.modelStatus[modelId] = 'not-installed';
+    if (canceled) saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: null, dismissedAt: Date.now() });
     else {
       M.error = 'The model could not be loaded. Check your connection, available storage, and graphics support, then retry.';
       M.bannerError = true;
@@ -397,11 +466,19 @@ async function loadModelFromConsent() {
   render();
 }
 
-async function removeModel() {
+async function removeModel(modelId) {
+  modelId = modelId || M.activeModel || MODEL_CONFIG.id;
   M.status = 'downloading'; M.error = ''; M.bannerError = false; M.userInitiated = false; render();
   try {
-    await onDeviceModel.remove(MODEL_CONFIG.id);
-    saveModelChoice('declined'); M.status = 'not-installed'; M.progress = 0;
+    await onDeviceModel.remove(modelId);
+    M.modelStatus[modelId] = 'not-installed';
+    if (M.activeModel === modelId) {
+      M.activeModel = null;
+      saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: null, dismissedAt: Date.now() });
+    } else {
+      saveModelSettings({ choice: 'accepted', preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() });
+    }
+    M.status = 'not-installed'; M.progress = 0;
   } catch {
     M.status = 'ready'; M.error = 'The model could not be removed from this browser. Try again from Settings.';
   }
@@ -409,32 +486,44 @@ async function removeModel() {
 }
 
 async function initializeModel() {
-  let adapter = null;
-  try { adapter = await globalThis.navigator?.gpu?.requestAdapter(); } catch { /* unavailable */ }
-  M.supported = !!adapter;
-  if (!M.supported) { M.status = 'unsupported'; M.prompt = false; render(); return; }
-  let choice = null;
-  try { choice = JSON.parse(localStorage.getItem(MODEL_CHOICE_KEY) || 'null')?.choice || null; } catch { /* treat as first visit */ }
-  if (choice === 'declined') { M.prompt = false; M.status = 'not-installed'; render(); return; }
-  if (choice === 'accepted') {
+  const caps = await detectDeviceCapabilities();
+  M.supported = caps.webgpu;
+  M.deviceTier = caps.tier;
+  if (!caps.webgpu) { M.status = 'unsupported'; M.prompt = false; render(); return; }
+  const settings = loadModelSettings();
+  if (settings) { M.preference = settings.preference || 'automatic'; }
+  // Check cache for each model
+  let installed = [];
+  for (const model of MODEL_REGISTRY) {
+    if (caps.webgpu && getCompatibleModels(caps).some((m) => m.id === model.id)) {
+      try { M.modelStatus[model.id] = await onDeviceModel.isCached(model.id) ? 'ready' : 'not-installed'; }
+      catch { M.modelStatus[model.id] = 'not-installed'; }
+      if (M.modelStatus[model.id] === 'ready') installed.push(model.id);
+    } else {
+      M.modelStatus[model.id] = 'unavailable';
+    }
+  }
+  const recommended = selectBestModel(caps, { installed, preference: M.preference, previousModel: settings?.activeModel });
+  M.recommendedModel = recommended || null;
+  if (settings?.choice === 'declined' && !M.supported) { M.prompt = false; render(); return; }
+  if (settings?.choice === 'declined') { M.prompt = false; M.status = 'not-installed'; render(); return; }
+  if (settings?.choice === 'accepted') {
     M.prompt = false;
-    try {
-      if (await onDeviceModel.isCached(MODEL_CONFIG.id)) {
-        M.status = 'downloading';
-        let shown = -1;
-        await onDeviceModel.load(MODEL_CONFIG.id, progress => {
-          M.progress = progress.progress; M.progressText = progress.text;
-          const percent = Math.round(M.progress * 100);
-          if (percent !== shown) { shown = percent; render(); }
-        });
-        M.status = 'ready';
+    const activeId = settings.activeModel;
+    if (activeId && installed.includes(activeId)) {
+      M.activeModel = activeId; M.status = 'ready';
+      M.modelStatus[activeId] = 'ready';
+      // Load silently in background
+      try {
+        await onDeviceModel.load(activeId, progress => { M.progress = progress.progress; M.progressText = progress.text; });
+      } catch {
+        M.status = 'not-installed'; M.activeModel = null;
+        M.modelStatus[activeId] = 'not-installed';
       }
-    } catch {
-      M.status = 'not-installed';
-      M.error = 'The saved model could not be loaded. Retry from Settings.';
     }
     render(); return;
   }
+  // First visit: show the download prompt with the recommended model
   M.prompt = true;
   render();
 }
@@ -558,10 +647,12 @@ document.addEventListener('click', e => {
   else if (a === 'open') { S.cur = S.hist.find(x => x.id === b.dataset.id) || null; S.draft = S.cur?.text || ''; location.hash = '#/dashboard'; go(); }
   else if (a === 'demo') { S.draft = DEMO_PROMPT; render(); }
   else if (a === 'enable-model') loadModelFromConsent();
-  else if (a === 'dismiss-model') { saveModelChoice('declined'); M.prompt = false; M.bannerError = false; M.userInitiated = false; render(); }
-  else if (a === 'cancel-model') { onDeviceModel.cancel(); saveModelChoice('declined'); M.status = 'not-installed'; M.bannerError = false; M.userInitiated = false; render(); }
-  else if (a === 'remove-model') removeModel();
-  else if (a === 'redownload-model') onDeviceModel.remove(MODEL_CONFIG.id).then(() => loadModelFromConsent()).catch(() => { M.error = 'The model could not be cleared for a fresh download.'; render(); });
+  else if (a === 'dismiss-model') { saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() }); M.prompt = false; M.bannerError = false; M.userInitiated = false; render(); }
+  else if (a === 'cancel-model') { onDeviceModel.cancel(); saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: null, dismissedAt: Date.now() }); M.status = 'not-installed'; M.bannerError = false; M.userInitiated = false; render(); }
+  else if (a === 'remove-model') removeModel(b.dataset.model);
+  else if (a === 'redownload-model') { const mid = b.dataset.model || M.activeModel || MODEL_CONFIG.id; onDeviceModel.remove(mid).then(() => loadModelFromConsent(mid)).catch(() => { M.error = 'The model could not be cleared for a fresh download.'; render(); }); }
+  else if (a === 'download-model') loadModelFromConsent(b.dataset.model);
+  else if (a === 'switch-model') loadModelFromConsent(b.dataset.model);
   else if (a === 'add-requirement' && S.cur?.analysis) { S.cur.editRequirements ||= [...S.cur.analysis.requirements]; S.cur.editRequirements.push(''); render(); }
   else if (a === 'remove-requirement' && S.cur?.analysis) { S.cur.editRequirements.splice(+b.dataset.index, 1); render(); }
   else if (a === 'understand') { S.showUnderstand = !S.showUnderstand; render(); if (S.showUnderstand) { const el = $('.factor'); if (el) el.scrollIntoView({ behavior: 'smooth' }); } }
@@ -575,6 +666,12 @@ document.addEventListener('change', async e => {
   c.closest('li').classList.toggle('done', c.checked);
   $('#pct').textContent = pct(cur) + '%'; $('#bar').style.width = pct(cur) + '%';
   try { await P.save(S.user.uid, cur); } catch { S.err = 'Could not save your progress. Check your connection.'; c.checked = !c.checked; cur.done[+c.dataset.t] = c.checked; render(); }
+});
+document.addEventListener('change', async e => {
+  const sel = e.target.closest('[data-set-pref]'); if (!sel) return;
+  M.preference = sel.value;
+  saveModelSettings({ choice: 'accepted', preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() });
+  render();
 });
 document.addEventListener('input', e => {
   if (e.target.name === 'text') S.draft = e.target.value;
