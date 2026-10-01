@@ -137,6 +137,7 @@ export const onDeviceModel = {
       loadingModelId = null;
       return engine;
     } catch (error) {
+      console.error("[StudyLens] onDeviceModel.load failed:", error);
       if (currentLoad === loadId) {
         worker?.terminate();
         worker = null;

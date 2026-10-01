@@ -8,7 +8,9 @@
       { "key": "X-Content-Type-Options", "value": "nosniff" },
       { "key": "X-Frame-Options", "value": "DENY" },
       { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
-      { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.googleapis.com wss://*.firebaseio.com https://huggingface.co https://*.huggingface.co https://us.aws.cdn.hf.co https://*.xethub.hf.co https://raw.githubusercontent.com; worker-src 'self' blob:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" }
+      { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.googleapis.com wss://*.firebaseio.com https://huggingface.co https://*.huggingface.co https://us.aws.cdn.hf.co https://*.xethub.hf.co https://cdn-lfs.huggingface.co https://github.com https://objects.githubusercontent.com https://raw.githubusercontent.com; worker-src 'self' blob:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" }
+      , { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
+      , { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" }
     ] },
     { "source": "/sw.js", "headers": [ { "key": "Cache-Control", "value": "no-cache" } ] }
   ]

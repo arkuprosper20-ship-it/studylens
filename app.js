@@ -258,6 +258,12 @@ function shell(page) {
 function settingsView() {
   const pref = M.preference || 'automatic';
   const refreshModelStatus = async () => {
+    if (loadModelSettings()?.choice !== 'accepted') {
+      for (const model of MODEL_REGISTRY) {
+        if (!M.modelStatus[model.id]) M.modelStatus[model.id] = M.supported ? 'not-installed' : 'unavailable';
+      }
+      return;
+    }
     for (const model of MODEL_REGISTRY) {
       if (M.supported && !M.modelStatus[model.id]) {
         try { M.modelStatus[model.id] = await onDeviceModel.isCached(model.id) ? 'ready' : 'not-installed'; }
@@ -455,11 +461,12 @@ async function loadModelFromConsent(modelId) {
     });
     M.status = 'ready'; M.error = ''; M.bannerError = false; M.userInitiated = false; M.activeModel = modelId; M.modelStatus[modelId] = 'ready';
   } catch (error) {
+    console.error("Model load failed:", error);
     const canceled = /canceled/i.test(error?.message || '');
     M.status = 'not-installed'; M.userInitiated = false; M.modelStatus[modelId] = 'not-installed';
     if (canceled) saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: null, dismissedAt: Date.now() });
     else {
-      M.error = 'The model could not be loaded. Check your connection, available storage, and graphics support, then retry.';
+      M.error = 'The model could not be loaded. ' + (error?.message || 'Check your connection, available storage, and graphics support.') + ' — try again from Settings.';
       M.bannerError = true;
     }
   }
@@ -492,12 +499,17 @@ async function initializeModel() {
   if (!caps.webgpu) { M.status = 'unsupported'; M.prompt = false; render(); return; }
   const settings = loadModelSettings();
   if (settings) { M.preference = settings.preference || 'automatic'; }
-  // Check cache for each model
+  // Don't load the WebLLM runtime or inspect its cache before consent.
+  const hasConsent = settings?.choice === 'accepted';
   let installed = [];
   for (const model of MODEL_REGISTRY) {
     if (caps.webgpu && getCompatibleModels(caps).some((m) => m.id === model.id)) {
-      try { M.modelStatus[model.id] = await onDeviceModel.isCached(model.id) ? 'ready' : 'not-installed'; }
-      catch { M.modelStatus[model.id] = 'not-installed'; }
+      if (hasConsent) {
+        try { M.modelStatus[model.id] = await onDeviceModel.isCached(model.id) ? 'ready' : 'not-installed'; }
+        catch { M.modelStatus[model.id] = 'not-installed'; }
+      } else {
+        M.modelStatus[model.id] = 'not-installed';
+      }
       if (M.modelStatus[model.id] === 'ready') installed.push(model.id);
     } else {
       M.modelStatus[model.id] = 'unavailable';
