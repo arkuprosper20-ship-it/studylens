@@ -348,6 +348,11 @@ function stripPromptInjection(text) {
   return text.replace(/\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:the\s+)?(?:previous|prior|above)\s+instructions?\b[^.!?\n]*(?:[.!?]|$)/gi, " ");
 }
 
+function hasAssignmentSignal(text, rules) {
+  return !!(rules.topic || rules.length?.label || rules.sources != null || rules.deadline)
+    || /\b(?:assignment|homework|coursework|classwork|teacher|instructor|professor|essay|paper|report|project|presentation|worksheet|lab report|submit|hand\s+(?:it|this|the)\s+in|turn\s+(?:it|this)\s+in|due|deadline|\d+\s*(?:words?|pages?|slides?|sources?))\b/i.test(text);
+}
+
 function lengthLabel(length) {
   const parts = [];
   if (length.minWords && length.maxWords && length.minWords !== length.maxWords) parts.push(`${fmt(length.minWords)}–${fmt(length.maxWords)} words`);
@@ -396,8 +401,10 @@ export function mergeAssignmentSuggestions(rawText, rules, suggestion, { now = n
 
   if (!suggestion || typeof suggestion !== "object") return rebuildAssignmentPlan(result, { now });
   if (suggestion.isAssignment === false) {
-    result.isAssignment = false;
-    return rebuildAssignmentPlan(result, { now });
+    if (!hasAssignmentSignal(supportedText, rules)) {
+      result.isAssignment = false;
+      return rebuildAssignmentPlan(result, { now });
+    }
   }
 
   if (rules.typeConfidence < 0.7 && MODEL_TYPES.has(suggestion.type)) {
@@ -439,6 +446,13 @@ export function mergeAssignmentSuggestions(rawText, rules, suggestion, { now = n
     result.deadline = parseDeadline(result.deadlineText, now);
     result.deadlineNeedsConfirmation = !result.deadline;
     result.fieldSources.deadline = FIELD_SOURCE.ai;
+  }
+  if (!result.deadline && !result.deadlineText) {
+    const vagueDeadline = supportedText.match(/\b(?:before|by|due|submit|hand\s+(?:it\s+)?in|turn\s+(?:it\s+)?in)\s+(?:on\s+)?(?:the\s+)?(?:weekend|end\s+of\s+(?:the\s+)?week)\b/i);
+    if (vagueDeadline) {
+      result.deadlineText = vagueDeadline[0].trim();
+      result.deadlineNeedsConfirmation = true;
+    }
   }
 
   const knownRequirements = new Set(result.requirements.map((item) => item.toLowerCase()));

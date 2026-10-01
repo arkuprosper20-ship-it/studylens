@@ -95,7 +95,7 @@ function buildUnderstanding(r, text) {
 // </analysis>
 
 async function analyze(text) {
-  return analyzeAssignmentWithModel(text, { modelReady: M.status === 'ready' });
+  return analyzeAssignmentWithModel(text);
 }
 function displayAnalysis(analysis, text) {
   const legacy = analyzeLocal(text);
@@ -208,7 +208,7 @@ function modelBanner() {
   if (M.prompt) return `<section class="model-banner" role="dialog" aria-label="On-device model choice">
     <div><h2>Make StudyLens smarter on your device</h2><p>A small AI model downloads once (about ${MODEL_CONFIG.sizeMB} MB). AI analysis runs on this device; your text is not sent to an AI server. No API key is needed, and StudyLens works without it.</p></div>
     <div class="btns"><button class="btn pri" data-a="enable-model">Download model</button><button class="btn" data-a="dismiss-model">Not now</button></div></section>`;
-  if (M.userInitiated && M.status === 'downloading') return `<section class="model-banner" role="status"><div><h3>Downloading ${esc(MODEL_CONFIG.label)}</h3><p class="mu">${esc(M.progressText || 'Preparing the on-device model…')}</p><div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}%</p></div><button class="btn btn-sm" data-a="cancel-model">Cancel</button></section>`;
+  if (M.userInitiated && M.status === 'downloading') return `<section class="model-banner" role="status"><div><h3>Downloading ${esc(MODEL_CONFIG.name || MODEL_CONFIG.label)}</h3><p class="mu">${esc(M.progressText || 'Preparing the on-device model…')}</p><div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}%</p></div><button class="btn btn-sm" data-a="cancel-model">Cancel</button></section>`;
   if (M.bannerError) return `<section class="model-banner" role="alert"><div><h3>Model download didn’t finish</h3><p>${esc(M.error || 'Check your connection, available storage, and graphics support, then try again.')}</p></div><div class="btns"><button class="btn pri" data-a="enable-model">Retry</button><button class="btn" data-a="dismiss-model">Not now</button></div></section>`;
   return '';
 }
@@ -251,7 +251,7 @@ function settingsView() {
   const note = M.status === 'unsupported'
     ? '<p class="note">Smarter analysis isn’t supported on this device. StudyLens still analyzes assignments and builds plans.</p>'
     : '<p class="note">When enabled, the model runs on your device with no API key; assignment text is not sent to an AI server. Confirmed assignments may still sync to your account.</p>';
-  return `<h1>Settings</h1><section class="card model-settings"><div><h3>Smarter analysis</h3><p class="mu">${esc(MODEL_CONFIG.label)} · approximately ${MODEL_CONFIG.sizeMB} MB</p></div>
+  return `<h1>Settings</h1><section class="card model-settings"><div><h3>Smarter analysis</h3><p class="mu">${esc(MODEL_CONFIG.name || MODEL_CONFIG.label)} · approximately ${MODEL_CONFIG.sizeMB} MB</p></div>
     <p class="model-status">Model status: <b>${status}</b></p>${M.status === 'downloading' ? `<div class="bar"><i style="width:${Math.round(M.progress * 100)}%"></i></div><p class="mu">${Math.round(M.progress * 100)}% · ${esc(M.progressText)}</p>` : ''}
     ${M.error && !M.bannerError ? `<p class="err" role="alert">${esc(M.error)}</p>` : ''}${note}<div class="btns">${action}</div></section>`;
 }
@@ -379,7 +379,7 @@ async function loadModelFromConsent() {
   render();
   try {
     let shown = -1;
-    await onDeviceModel.load(progress => {
+    await onDeviceModel.load(MODEL_CONFIG.id, progress => {
       M.progress = progress.progress; M.progressText = progress.text;
       const percent = Math.round(M.progress * 100);
       if (percent !== shown) { shown = percent; render(); }
@@ -400,7 +400,7 @@ async function loadModelFromConsent() {
 async function removeModel() {
   M.status = 'downloading'; M.error = ''; M.bannerError = false; M.userInitiated = false; render();
   try {
-    await onDeviceModel.remove();
+    await onDeviceModel.remove(MODEL_CONFIG.id);
     saveModelChoice('declined'); M.status = 'not-installed'; M.progress = 0;
   } catch {
     M.status = 'ready'; M.error = 'The model could not be removed from this browser. Try again from Settings.';
@@ -419,10 +419,10 @@ async function initializeModel() {
   if (choice === 'accepted') {
     M.prompt = false;
     try {
-      if (await onDeviceModel.isCached()) {
+      if (await onDeviceModel.isCached(MODEL_CONFIG.id)) {
         M.status = 'downloading';
         let shown = -1;
-        await onDeviceModel.load(progress => {
+        await onDeviceModel.load(MODEL_CONFIG.id, progress => {
           M.progress = progress.progress; M.progressText = progress.text;
           const percent = Math.round(M.progress * 100);
           if (percent !== shown) { shown = percent; render(); }
@@ -561,7 +561,7 @@ document.addEventListener('click', e => {
   else if (a === 'dismiss-model') { saveModelChoice('declined'); M.prompt = false; M.bannerError = false; M.userInitiated = false; render(); }
   else if (a === 'cancel-model') { onDeviceModel.cancel(); saveModelChoice('declined'); M.status = 'not-installed'; M.bannerError = false; M.userInitiated = false; render(); }
   else if (a === 'remove-model') removeModel();
-  else if (a === 'redownload-model') onDeviceModel.remove().then(() => loadModelFromConsent()).catch(() => { M.error = 'The model could not be cleared for a fresh download.'; render(); });
+  else if (a === 'redownload-model') onDeviceModel.remove(MODEL_CONFIG.id).then(() => loadModelFromConsent()).catch(() => { M.error = 'The model could not be cleared for a fresh download.'; render(); });
   else if (a === 'add-requirement' && S.cur?.analysis) { S.cur.editRequirements ||= [...S.cur.analysis.requirements]; S.cur.editRequirements.push(''); render(); }
   else if (a === 'remove-requirement' && S.cur?.analysis) { S.cur.editRequirements.splice(+b.dataset.index, 1); render(); }
   else if (a === 'understand') { S.showUnderstand = !S.showUnderstand; render(); if (S.showUnderstand) { const el = $('.factor'); if (el) el.scrollIntoView({ behavior: 'smooth' }); } }
