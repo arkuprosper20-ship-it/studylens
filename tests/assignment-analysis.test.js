@@ -113,7 +113,7 @@ test("model input is capped and the summary flags truncation", async () => {
 });
 
 test("model config uses the documented prebuilt Qwen2.5 0.5B ID", () => {
-  assert.equal(MODEL_CONFIG.id, "Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+  assert.equal(MODEL_CONFIG.id, "Qwen2.5-0.5B-Instruct-q4f32_1-MLC");
   assert.equal(MODEL_CONFIG.sizeMB, 266);
 });
 
@@ -132,7 +132,7 @@ test("model registry contains only verified WebLLM model IDs", () => {
 });
 
 test("getById returns the correct model", () => {
-  assert.equal(getModelById("Qwen2.5-0.5B-Instruct-q4f16_1-MLC"), MODEL_REGISTRY[0]);
+  assert.equal(getModelById("Qwen2.5-0.5B-Instruct-q4f32_1-MLC"), MODEL_REGISTRY[0]);
   assert.equal(getModelById("nonexistent"), undefined);
 });
 
