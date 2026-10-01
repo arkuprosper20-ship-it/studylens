@@ -2,20 +2,14 @@
 /* StudyLens — vanilla JS. Sections: config · analysis · auth/data providers · UI. */
 
 import { parseAssignmentDeadline, rebuildAssignmentPlan } from './studylens-analyzer.js';
-import { analyzeAssignmentWithModel, MAX_MODEL_INPUT_CHARS, MODEL_CONFIG, MODEL_REGISTRY, getModelById, onDeviceModel } from './on-device-ai.js';
+import { MAX_MODEL_INPUT_CHARS, MODEL_CONFIG, MODEL_REGISTRY, getModelById, onDeviceModel } from './on-device-ai.js';
 import { detectDeviceCapabilities } from './studylens-device.js';
 import { getCompatibleModels, selectBestModel } from './studylens-model-selector.js';
+import { analyzeAssignmentWithAI } from './ai-provider.js';
+import { groqProvider } from './groq-provider.js';
+import { FIREBASE_CONFIG, ADMIN_UID } from './firebase-config.js';
+import { logAnalysisEvent } from './admin-service.js';
 
-// Production auth: paste your Firebase web config here (see README). null = local prototype mode.
-const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyBvdq6jnAptb9LXY55GBrxc_heGJrRq6J4",
-  authDomain: "pawidhack.firebaseapp.com",
-  projectId: "pawidhack",
-  storageBucket: "pawidhack.firebasestorage.app",
-  messagingSenderId: "64849933348",
-  appId: "1:64849933348:web:899cbbb5c678a87bfc14b1",
-  measurementId: "G-VZWM75QS7J"
-};
 const DEMO_PROMPT = 'Write a 1,500-word essay about climate change. Use at least 3 credible sources. Discuss two causes, explain the effects, propose solutions, and submit by Friday.';
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -97,7 +91,11 @@ function buildUnderstanding(r, text) {
 // </analysis>
 
 async function analyze(text) {
-  return analyzeAssignmentWithModel(text);
+  return analyzeAssignmentWithAI(text, {
+    mode: AI.mode,
+    groqEnabledInAutomatic: AI.allowGroqFallback,
+    getGroqToken: () => P?.getIdToken?.(),
+  });
 }
 function displayAnalysis(analysis, text) {
   const legacy = analyzeLocal(text);
@@ -163,6 +161,8 @@ async function firebaseProvider(cfg) {
   let cb = () => {};
   return {
     mode: 'firebase',
+    db,
+    getIdToken: () => auth.currentUser ? A.getIdToken(auth.currentUser) : Promise.resolve(null),
     onChange(f) { cb = f; A.onAuthStateChanged(auth, u => cb(pub(u))); },
     register: wrap(async (name, email, pw) => {
       const { user } = await A.createUserWithEmailAndPassword(auth, email, pw);
@@ -191,11 +191,12 @@ async function firebaseProvider(cfg) {
 
 /* ---------- UI ---------- */
 let P;
-const S = { user: null, ready: false, cur: null, hist: [], draft: '', tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: '', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
-const ADMIN_UID = 'AXYnNwTzgWhwlLqhqDsNjcm8Wzr1';
+const S = { user: null, ready: false, cur: null, hist: [], draft: '', image: null, imageMessage: '', imageBusy: false, tab: 'login', err: '', msg: '', busy: false, fatal: '', adminUid: '', adminUser: null, adminAssignments: [], adminSearched: false, showUnderstand: false, taught: new Set(), answers: {} };
 const MODEL_CHOICE_KEY = 'studylens.model-choice.v1';
 const MODEL_SETTINGS_KEY = 'studylens.model-settings.v2';
+const AI_SETTINGS_KEY = 'studylens.ai-settings.v1';
 const M = { supported: null, deviceTier: null, status: 'not-installed', prompt: false, recommendedModel: null, progress: 0, progressText: '', error: '', bannerError: false, userInitiated: false, activeModel: null, modelStatus: {}, preference: 'automatic' };
+const AI = { mode: 'automatic', allowGroqFallback: false, groqConfigured: false, groqStatus: 'checking', groqModels: null, groqChecked: false };
 const isAdmin = () => S.user?.uid === ADMIN_UID;
 const route = () => { const r = location.hash.replace(/^#\/?/, ''); return ['dashboard', 'history', 'account', 'settings', 'admin'].includes(r) && (r !== 'admin' || isAdmin()) ? r : 'dashboard'; };
 const initials = n => (n || '?').trim().split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
@@ -215,6 +216,35 @@ function loadModelSettings() {
 }
 function saveModelChoice(choice) {
   saveModelSettings({ choice, preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() });
+}
+
+function loadAISettings() {
+  try {
+    const settings = JSON.parse(localStorage.getItem(AI_SETTINGS_KEY) || 'null');
+    if (settings && ['automatic', 'on-device', 'groq', 'rules'].includes(settings.mode)) {
+      AI.mode = settings.mode;
+      AI.allowGroqFallback = settings.allowGroqFallback === true;
+    }
+  } catch { /* use automatic mode */ }
+}
+
+function saveAISettings() {
+  try { localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify({ mode: AI.mode, allowGroqFallback: AI.allowGroqFallback })); } catch { /* best-effort */ }
+}
+
+async function refreshGroqStatus() {
+  AI.groqChecked = true;
+  AI.groqStatus = 'checking';
+  try {
+    const status = await groqProvider.getStatus();
+    AI.groqConfigured = status.configured === true;
+    AI.groqModels = status;
+    AI.groqStatus = AI.groqConfigured ? 'configured' : 'not-configured';
+  } catch {
+    AI.groqConfigured = false;
+    AI.groqStatus = 'unavailable';
+  }
+  render();
 }
 
 function modelBanner() {
@@ -256,6 +286,7 @@ function shell(page) {
 }
 
 function settingsView() {
+  if (!AI.groqChecked) refreshGroqStatus();
   const pref = M.preference || 'automatic';
   const refreshModelStatus = async () => {
     if (loadModelSettings()?.choice !== 'accepted') {
@@ -311,8 +342,12 @@ function settingsView() {
     <p class="mu" style="font-size:.8rem">Device tier: <b>${M.deviceTier || '—'}</b></p>
     <p class="mu" style="font-size:.8rem">Active model: <b>${onDeviceModel.getActiveModel() || 'none'}</b></p>
     <p class="mu" style="font-size:.8rem">WebGPU adapter: ${M.deviceTier ? 'available' : 'unavailable'}</p></details>` : '';
+  const groqStatus = AI.groqStatus === 'checking' ? 'Checking…' : AI.groqStatus === 'configured' ? 'Configured' : AI.groqStatus === 'not-configured' ? 'Not configured' : 'Unavailable';
+  const groqModeNote = AI.mode === 'groq' || AI.allowGroqFallback
+    ? '<p class="note">When selected or explicitly allowed as an automatic fallback, assignment text is sent to Groq Cloud. You can disable it at any time.</p>'
+    : '<p class="note">Groq is not used unless you select Groq Cloud or explicitly allow it as an Automatic fallback.</p>';
   return `<h1>Settings</h1><section class="card model-settings">
-    <div><h3>On-device AI</h3><p class="mu">StudyLens analyzes assignments with its rules engine first, then uses an optional AI model to fill gaps. All AI runs locally — no API key, no cloud inference.</p></div>
+    <div><h3>On-device AI</h3><p class="mu">StudyLens analyzes assignments with its rules engine first, then can use the optional local model. Groq Cloud is a separate opt-in mode.</p></div>
     <label>Model preference${M.supported ? '' : ' (unavailable)'}
       <select name="model-preference" data-set-pref ${M.supported ? '' : 'disabled'}>
         <option value="automatic" ${pref === 'automatic' ? 'selected' : ''}>Automatic — StudyLens chooses</option>
@@ -326,24 +361,108 @@ function settingsView() {
     ${modelsHtml}
     ${M.error && !M.bannerError ? `<p class="err" role="alert">${esc(M.error)}</p>` : ''}${tech}
     ${note}<div class="btns">${M.supported && !onDeviceModel.getActiveModel() && onDeviceModel.getLoadingModel() === null ? `<button class="btn pri" data-a="enable-model">Download ${M.recommendedModel?.name || MODEL_CONFIG.name}</button>` : ''}</div>
+    </section>
+    <section class="card model-settings ai-provider-settings">
+      <div><h3>AI &amp; Analysis</h3><p class="mu">Rules always run first and remain available without AI.</p></div>
+      <label>AI Mode<select data-ai-mode>
+        <option value="automatic" ${AI.mode === 'automatic' ? 'selected' : ''}>Automatic</option>
+        <option value="on-device" ${AI.mode === 'on-device' ? 'selected' : ''}>On-device AI</option>
+        <option value="groq" ${AI.mode === 'groq' ? 'selected' : ''}>Groq Cloud</option>
+        <option value="rules" ${AI.mode === 'rules' ? 'selected' : ''}>Rules only</option>
+      </select></label>
+      <label class="provider-toggle"><input type="checkbox" data-allow-groq ${AI.allowGroqFallback ? 'checked' : ''}> Allow Groq as Automatic fallback</label>
+      <div class="provider-status"><p><b>Rules engine</b><span class="status-ready">Always available</span></p>
+        <p><b>On-device AI</b><span>${M.activeModel ? 'Ready' : M.supported ? 'Available after download' : 'Unavailable on this device'}</span></p>
+        <p><b>Groq Cloud</b><span class="${AI.groqConfigured ? 'status-ready' : 'status-not-installed'}">${groqStatus}</span></p></div>
+      ${groqModeNote}
+      ${!AI.groqConfigured ? '<p class="note">Configure <code>GROQ_API_KEY</code> on the server. It is never stored in this browser.</p>' : ''}
+      <button type="button" class="btn btn-sm" data-a="refresh-groq">Refresh Groq status</button>
     </section>`;
 }
 
 function dashView() {
   return `<div><h1>What are you working on?</h1><p class="mu" style="margin-top:.6rem">Paste the full assignment prompt below.</p></div>
-  <form class="card" data-form="analyze"><textarea name="text" aria-label="Assignment prompt" placeholder="e.g. Write a 1,500-word essay about climate change. Use at least 3 credible sources…">${esc(S.draft)}</textarea>
-  <p class="err" role="alert">${esc(S.err)}</p><div class="btns"><button class="btn pri" ${S.busy ? 'disabled' : ''}>Analyze assignment →</button><button class="btn" data-a="demo" ${S.busy ? 'disabled' : ''}>Load demo</button></div></form>
+  <form class="card" data-form="analyze"><div class="input-mode"><button class="btn btn-sm" type="button" data-a="focus-prompt">Paste assignment</button><button class="btn btn-sm" type="button" data-a="choose-image">Upload image</button><input id="assignment-image" type="file" accept="image/png,image/jpeg,image/webp,application/pdf" hidden></div>
+  <textarea name="text" aria-label="Assignment prompt" placeholder="Paste the instructions here…">${esc(S.draft)}</textarea>
+  <div class="image-dropzone" data-dropzone><span>Drop an assignment image here</span><span class="mu">PNG, JPG, WebP · up to 4 MB</span></div>
+  ${S.image ? `<div class="image-preview"><img src="${esc(S.image.dataUrl)}" alt="Preview of ${esc(S.image.name)}"><div><b>${esc(S.image.name)}</b><p class="mu">Image preview stays on this device until you request text extraction.</p><div class="btns"><button class="btn btn-sm pri" type="button" data-a="extract-image" ${S.imageBusy ? 'disabled' : ''}>${S.imageBusy ? 'Extracting…' : 'Extract text with Groq Vision'}</button><button class="btn btn-sm" type="button" data-a="remove-image">Remove image</button></div></div></div>` : ''}
+  ${S.imageMessage ? `<p class="note" role="status">${esc(S.imageMessage)}</p>` : ''}
+  <p class="note">Image extraction uses Groq Vision only after you click the button. Review and correct the extracted text above before analyzing it. If vision is unavailable, paste the text instead.</p>
+  <p class="err" role="alert">${esc(S.err)}</p><div class="btns"><button class="btn pri" ${S.busy ? 'disabled' : ''}>Analyze assignment →</button><button class="btn" type="button" data-a="demo" ${S.busy ? 'disabled' : ''}>Load demo</button></div></form>
   ${S.cur ? resultView(S.cur) : `<div class="card empty"><svg viewBox="0 0 120 90" fill="none" stroke="#A78BFA" stroke-width="2"><rect x="22" y="8" width="60" height="74" rx="8" fill="#0C131E"/><path d="M34 26h36M34 38h36M34 50h20" opacity=".5"/><circle cx="82" cy="58" r="17" fill="#A78BFA22"/><path d="M94 70l12 12"/></svg><h3 style="color:var(--tx)">No assignment yet</h3><p>Paste a prompt above and StudyLens will find the requirements and build your plan.</p></div>`}`;
+}
+
+function loadAssignmentImage(file) {
+  S.imageMessage = '';
+  if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+    S.image = null;
+    S.imageMessage = 'PDF processing is not available yet. Export a page as an image or paste its text.';
+    render();
+    return;
+  }
+  if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+    S.image = null; S.imageMessage = 'Use a PNG, JPG, or WebP image.'; render(); return;
+  }
+  if (file.size > 4 * 1024 * 1024) {
+    S.image = null; S.imageMessage = 'Choose an image smaller than 4 MB.'; render(); return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => { S.image = { name: file.name, type: file.type, dataUrl: String(reader.result) }; S.imageMessage = ''; render(); };
+  reader.onerror = () => { S.image = null; S.imageMessage = 'This image could not be read. Try another file.'; render(); };
+  reader.readAsDataURL(file);
+}
+
+async function extractImageText() {
+  if (!S.image || S.imageBusy) return;
+  const groqAllowed = AI.mode === 'groq' || (AI.mode === 'automatic' && AI.allowGroqFallback);
+  if (!groqAllowed) {
+    S.imageMessage = 'Image analysis unavailable with the current provider. Enable Groq Cloud in Settings or paste the text instead.';
+    render();
+    return;
+  }
+  S.imageBusy = true; S.imageMessage = 'Checking Groq Vision…'; render();
+  try {
+    const status = await groqProvider.getStatus();
+    AI.groqConfigured = status.configured === true;
+    AI.groqStatus = AI.groqConfigured ? 'configured' : 'not-configured';
+    if (!AI.groqConfigured) throw new Error('Groq Cloud is not configured on the server.');
+    const token = await P?.getIdToken?.();
+    if (!token) throw new Error('Sign in with Firebase to use Groq Cloud.');
+    const result = await groqProvider.extractImageText(S.image.dataUrl, { token });
+    S.draft = result.extractedText;
+    S.imageMessage = `Text extracted with Groq Vision (${result.model}). Review and correct it above before analyzing.`;
+  } catch (error) {
+    S.imageMessage = error?.message || 'Image analysis unavailable with the current provider. Try a clearer image or paste the text instead.';
+  }
+  S.imageBusy = false;
+  render();
 }
 
 function resultView(a) {
   if (!a.analysis) return legacyResultView(a);
   const r = a.result, analysis = a.analysis, ns = 'Not specified';
-  const tags = field => analysis.fieldSources?.[field] === 'on-device AI' ? '<span class="ai-tag">AI-assisted</span>' : '';
+  const sourceTag = source => !source || source === 'rules' ? '<span class="source-tag rules-tag">Detected</span>' : `<span class="source-tag">${esc(source)}</span>`;
+  const tags = field => sourceTag(analysis.fieldSources?.[field]);
   const field = (name, label, source, missing, control) => `<label class="summary-field ${missing ? 'field-missing' : ''}"><span>${label} ${tags(source)}</span>${control}</label>`;
   const required = a.editRequirements || analysis.requirements || [], edits = a.edits || {};
   const requirementInputs = required.map((item, index) => `<div class="requirement-edit"><input name="requirements" data-requirement="${index}" aria-label="Requirement ${index + 1}" value="${esc(item)}"><button class="btn btn-sm" type="button" data-a="remove-requirement" data-index="${index}" aria-label="Remove requirement ${index + 1}">Remove</button></div>`).join('');
+  const providerLabels = { rules: 'Analyzed with Rules', webllm: 'Enhanced with On-device AI', groq: 'Enhanced with Groq Cloud AI' };
+  const providerLabel = providerLabels[analysis.analysisProvider || 'rules'];
+  const fieldsBySource = Object.entries(analysis.fieldSources || {}).reduce((groups, [fieldName, source]) => {
+    (groups[source] ||= []).push(fieldName);
+    return groups;
+  }, {});
   return `<section class="card understood"><p class="mu">What we understood</p><h2>${analysis.isAssignment === false ? 'This may not be an assignment prompt' : 'Check the assignment details'}</h2>
+    <div class="analysis-provenance"><span class="provider-badge provider-${esc(analysis.analysisProvider || 'rules')}">${providerLabel}</span>
+      <details><summary>View analysis details</summary><div class="analysis-details">
+        <p><b>Provider</b><span>${providerLabel}</span></p>
+        ${analysis.analysisModel ? `<p><b>Model</b><span>${esc(analysis.analysisModel)}</span></p>` : ''}
+        ${Number.isFinite(analysis.analysisMs) ? `<p><b>Processing time</b><span>${(analysis.analysisMs / 1000).toFixed(1)}s</span></p>` : ''}
+        <p><b>Rules confidence</b><span>${Math.round((analysis.analysisConfidence ?? analysis.confidence ?? 0) * 100)}%</span></p>
+        <p><b>Rules fields</b><span>${esc((fieldsBySource.rules || []).join(', ') || 'none')}</span></p>
+        <p><b>AI-enhanced fields</b><span>${esc([...(fieldsBySource['On-device AI'] || []), ...(fieldsBySource['Groq Cloud AI'] || [])].join(', ') || 'none')}</span></p>
+        <p><b>Still uncertain</b><span>${esc((analysis.missing || []).join(', ') || 'none')}</span></p>
+      </div></details></div>
     ${analysis.isAssignment === false ? '<p class="warning-note">This doesn’t look like assignment instructions. Choose the type that best fits, or edit the details before building a plan.</p>' : ''}
     ${analysis.inputTruncated ? `<p class="warning-note">The prompt is longer than ${MAX_MODEL_INPUT_CHARS.toLocaleString()} characters. Rules analyzed the full text; on-device AI saw only the first ${MAX_MODEL_INPUT_CHARS.toLocaleString()} characters.</p>` : ''}
     <form class="summary-form" data-form="confirm-analysis">
@@ -615,6 +734,15 @@ document.addEventListener('submit', e => {
       const analysis = await analyze(S.draft), result = displayAnalysis(analysis, S.draft);
       S.cur = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), createdAt: Date.now(), text: S.draft,
         analysis, result, done: [], confirmed: false, editRequirements: [...analysis.requirements], edits: {} };
+      void logAnalysisEvent(P?.db, {
+        userId: S.user?.uid,
+        provider: analysis.analysisProvider,
+        model: analysis.analysisModel,
+        confidence: analysis.analysisConfidence,
+        ms: analysis.analysisMs,
+        fallbackFrom: analysis.fallbackFrom,
+        isAssignment: analysis.isAssignment,
+      });
     });
   }
   if (kind === 'confirm-analysis') {
@@ -662,6 +790,7 @@ document.addEventListener('click', e => {
   else if (a === 'dismiss-model') { saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() }); M.prompt = false; M.bannerError = false; M.userInitiated = false; render(); }
   else if (a === 'cancel-model') { onDeviceModel.cancel(); saveModelSettings({ choice: 'declined', preference: M.preference, activeModel: null, dismissedAt: Date.now() }); M.status = 'not-installed'; M.bannerError = false; M.userInitiated = false; render(); }
   else if (a === 'remove-model') removeModel(b.dataset.model);
+  else if (a === 'refresh-groq') refreshGroqStatus();
   else if (a === 'redownload-model') { const mid = b.dataset.model || M.activeModel || MODEL_CONFIG.id; onDeviceModel.remove(mid).then(() => loadModelFromConsent(mid)).catch(() => { M.error = 'The model could not be cleared for a fresh download.'; render(); }); }
   else if (a === 'download-model') loadModelFromConsent(b.dataset.model);
   else if (a === 'switch-model') loadModelFromConsent(b.dataset.model);
@@ -670,6 +799,22 @@ document.addEventListener('click', e => {
   else if (a === 'understand') { S.showUnderstand = !S.showUnderstand; render(); if (S.showUnderstand) { const el = $('.factor'); if (el) el.scrollIntoView({ behavior: 'smooth' }); } }
   else if (a === 'teach') { S.taught.add(b.dataset.f); render(); }
   else if (a === 'answer') { S.answers[b.dataset.f] = +b.dataset.v; render(); }
+  else if (a === 'choose-image') $('#assignment-image')?.click();
+  else if (a === 'focus-prompt') $('textarea[name="text"]')?.focus();
+  else if (a === 'extract-image') extractImageText();
+  else if (a === 'remove-image') { S.image = null; S.imageMessage = ''; render(); }
+});
+
+document.addEventListener('change', e => {
+  if (e.target.id === 'assignment-image' && e.target.files?.[0]) loadAssignmentImage(e.target.files[0]);
+});
+document.addEventListener('dragover', e => {
+  if (e.target.closest('[data-dropzone]')) e.preventDefault();
+});
+document.addEventListener('drop', e => {
+  if (!e.target.closest('[data-dropzone]')) return;
+  e.preventDefault();
+  if (e.dataTransfer?.files?.[0]) loadAssignmentImage(e.dataTransfer.files[0]);
 });
 
 document.addEventListener('change', async e => {
@@ -685,6 +830,13 @@ document.addEventListener('change', async e => {
   saveModelSettings({ choice: 'accepted', preference: M.preference, activeModel: M.activeModel, dismissedAt: Date.now() });
   render();
 });
+document.addEventListener('change', e => {
+  const mode = e.target.closest('[data-ai-mode]');
+  const allowGroq = e.target.closest('[data-allow-groq]');
+  if (mode) AI.mode = mode.value;
+  if (allowGroq) AI.allowGroqFallback = allowGroq.checked;
+  if (mode || allowGroq) { saveAISettings(); render(); }
+});
 document.addEventListener('input', e => {
   if (e.target.name === 'text') S.draft = e.target.value;
   if (e.target.hasAttribute('data-understood-field') && S.cur?.analysis) {
@@ -697,6 +849,7 @@ document.addEventListener('input', e => {
 window.addEventListener('hashchange', go);
 
 (async function init() {
+  loadAISettings();
   try { P = FIREBASE_CONFIG ? await firebaseProvider(FIREBASE_CONFIG) : localProvider(); }
   catch (e) { console.error(e); S.fatal = 'Sign-in service is unavailable. Please try again later.'; return render(); }
   initializeModel();
